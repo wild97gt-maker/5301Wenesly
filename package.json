@@ -1,10 +1,11 @@
 {
   "name": "house-maintenance-tracker",
-  "version": "1.0.0",
+  "version": "1.1.0",
   "private": true,
   "description": "Track home maintenance schedules, projects, and preferred vendors.",
   "scripts": {
     "start": "python3 -m http.server 8000",
-    "test": "node --test tests/logic.test.js"
+    "build": "node scripts/build-artifact.js",
+    "test": "node --test tests/logic.test.js tests/store.test.js"
   }
 }

@@ -2,10 +2,10 @@
   "use strict";
 
   const L = window.HomeLogic;
-  const STORAGE_KEY = "house-maintenance-tracker:v1";
+  const S = window.HomeStore;
 
-  // Common tasks seeded on first visit so the list isn't empty. They have no
-  // "last serviced" date yet, so they show up as "Not yet serviced".
+  // Common tasks offered on an empty tracker. They have no "last serviced"
+  // date yet, so they show up as "Not yet serviced".
   const STARTER_TASKS = [
     ["Replace HVAC filter", "HVAC", 3, "months"],
     ["HVAC professional tune-up", "HVAC", 1, "years"],
@@ -17,59 +17,20 @@
     ["Replace fridge water filter", "Appliances", 6, "months"],
   ];
 
-  // ---------- State & persistence ----------
-
-  function uid() {
-    return Date.now().toString(36) + Math.random().toString(36).slice(2, 8);
+  function starterTasks() {
+    return STARTER_TASKS.map(([name, category, frequency, frequencyUnit]) => ({
+      id: S.uid(), name, category, location: "", frequency, frequencyUnit,
+      lastServiced: "", vendorId: "", notes: "", history: [],
+    }));
   }
 
-  function emptyState() {
-    return { tasks: [], projects: [], vendors: [] };
-  }
+  // ---------- State ----------
 
-  function normalize(data) {
-    const s = emptyState();
-    if (data && typeof data === "object") {
-      if (Array.isArray(data.tasks)) s.tasks = data.tasks.map((t) => ({ history: [], ...t }));
-      if (Array.isArray(data.projects)) s.projects = data.projects;
-      if (Array.isArray(data.vendors)) s.vendors = data.vendors;
-    }
-    return s;
-  }
-
-  function load() {
-    let raw = null;
-    try {
-      raw = localStorage.getItem(STORAGE_KEY);
-    } catch (e) {
-      /* storage unavailable: run in-memory */
-    }
-    if (raw === null) {
-      const s = emptyState();
-      s.tasks = STARTER_TASKS.map(([name, category, frequency, frequencyUnit]) => ({
-        id: uid(), name, category, location: "", frequency, frequencyUnit,
-        lastServiced: "", vendorId: "", notes: "", history: [],
-      }));
-      return s;
-    }
-    try {
-      return normalize(JSON.parse(raw));
-    } catch (e) {
-      console.error("Could not read saved data", e);
-      return emptyState();
-    }
-  }
-
-  let state = load();
-
-  function save() {
-    try {
-      localStorage.setItem(STORAGE_KEY, JSON.stringify(state));
-    } catch (e) {
-      alert("Could not save data in this browser. Use Export backup to keep a copy.");
-    }
-    render();
-  }
+  let state = S.emptyState();
+  let store = null;
+  let ready = false;
+  let readOnly = false;
+  let myId = null;
 
   // ---------- Helpers ----------
 
@@ -106,12 +67,93 @@
     return fields.some((f) => String(obj[f] ?? "").toLowerCase().includes(q));
   }
 
+  function safeUrl(url) {
+    if (!url) return "";
+    const withScheme = /^https?:\/\//i.test(url) ? url : `https://${url}`;
+    try {
+      const u = new URL(withScheme);
+      return u.protocol === "http:" || u.protocol === "https:" ? u.href : "";
+    } catch (e) {
+      return "";
+    }
+  }
+
   const STATUS_LABEL = {
     overdue: "Overdue",
     "due-soon": "Due soon",
     ok: "Up to date",
     never: "Not yet serviced",
   };
+
+  // ---------- Feedback: toast, banner, confirm ----------
+
+  let toastTimer = null;
+  function toast(message, kind = "info") {
+    const el = $("#toast");
+    el.textContent = message;
+    el.dataset.kind = kind;
+    el.hidden = false;
+    clearTimeout(toastTimer);
+    toastTimer = setTimeout(() => (el.hidden = true), kind === "error" ? 8000 : 3000);
+  }
+
+  function showBanner(message) {
+    const el = $("#banner");
+    el.textContent = message;
+    el.hidden = !message;
+  }
+
+  // alert() and confirm() don't work inside Claude's artifact viewer, so
+  // confirmations use an in-page dialog.
+  const confirmDialog = $("#confirm-dialog");
+  function askConfirm({ title, message, confirmLabel }) {
+    confirmDialog.querySelector("[data-confirm-title]").textContent = title;
+    confirmDialog.querySelector("[data-confirm-message]").textContent = message;
+    confirmDialog.querySelector("[data-confirm-ok]").textContent = confirmLabel;
+    confirmDialog.returnValue = "";
+    confirmDialog.showModal();
+    return new Promise((resolve) => {
+      confirmDialog.addEventListener("close", () => resolve(confirmDialog.returnValue === "ok"), { once: true });
+    });
+  }
+  $("#confirm-form").addEventListener("submit", (e) => {
+    e.preventDefault();
+    confirmDialog.close("ok");
+  });
+  confirmDialog.querySelector("[data-cancel]").addEventListener("click", () => confirmDialog.close("cancel"));
+
+  function setReadOnly(value) {
+    readOnly = value;
+    document.body.classList.toggle("read-only", value);
+    if (value) {
+      showBanner("You can view this tracker but not change it. Ask the person who shared it to give you edit access.");
+    }
+  }
+
+  // Runs a save and reports failures. Writes show up on screen right away;
+  // this only has to deal with the ones that didn't stick.
+  async function commit(promise) {
+    try {
+      await promise;
+      return true;
+    } catch (err) {
+      console.error(err);
+      const code = err && err.code;
+      if (code === "invalid_argument") {
+        setReadOnly(true);
+        toast("That change wasn't saved. You don't have edit access to this tracker.", "error");
+      } else if (code === "quota_exceeded") {
+        toast("The tracker is full. Delete some old items, then try again.", "error");
+      } else if (code === "resource_exhausted") {
+        toast("Too many changes at once. Wait a moment and try again.", "error");
+      } else if (code === "revoked") {
+        toast("Your access to this tracker changed. Reload the page.", "error");
+      } else {
+        toast((err && err.message) || "That change wasn't saved. Try again.", "error");
+      }
+      return false;
+    }
+  }
 
   // ---------- Rendering ----------
 
@@ -123,13 +165,27 @@
   }
 
   function renderSummary(sorted) {
+    if (!ready) {
+      $("#summary").innerHTML = "";
+      return;
+    }
     const counts = { overdue: 0, "due-soon": 0, never: 0, ok: 0 };
     sorted.forEach(({ info }) => counts[info.status]++);
+    const active = $("#task-filter").value;
     $("#summary").innerHTML = ["overdue", "due-soon", "never", "ok"]
-      .map((s) => `<button class="stat ${s}" data-filter="${s}">
+      .map((s) => `<button class="stat ${s}${active === s ? " active" : ""}" data-filter="${s}" aria-pressed="${active === s}">
           <span class="num">${counts[s]}</span><span class="lbl">${STATUS_LABEL[s]}</span>
         </button>`)
       .join("");
+  }
+
+  function setEmpty(id, message, showStarter) {
+    const el = $(id);
+    el.hidden = !message;
+    if (!message) return;
+    el.querySelector("[data-msg]").textContent = message;
+    const starter = el.querySelector("[data-action=add-starters]");
+    if (starter) starter.hidden = !showStarter;
   }
 
   function renderTasks() {
@@ -155,18 +211,20 @@
           ${info.nextDue ? `<div class="sub">${esc(L.describeDaysUntil(info.daysUntil))}</div>` : ""}</td>
         <td data-label="Status"><span class="badge ${info.status}">${STATUS_LABEL[info.status]}</span></td>
         <td data-label="Vendor">${vendor ? esc(vendor.name) : '<span class="sub">—</span>'}
-          ${vendor && vendor.phone ? `<div class="sub"><a href="tel:${esc(vendor.phone)}">${esc(vendor.phone)}</a></div>` : ""}</td>
+          ${vendor && vendor.phone ? `<div class="sub">${esc(vendor.phone)}</div>` : ""}</td>
         <td><div class="actions">
-          <button class="small primary" data-action="service" data-id="${task.id}">Mark done</button>
-          <button class="small" data-action="edit-task" data-id="${task.id}">Edit</button>
+          <button class="small primary" data-action="service" data-id="${esc(task.id)}" data-write>Mark done</button>
+          <button class="small" data-action="history" data-id="${esc(task.id)}">History</button>
+          <button class="small" data-action="edit-task" data-id="${esc(task.id)}" data-write>Edit</button>
         </div></td>
       </tr>`;
     }).join("");
 
-    $("#task-empty").hidden = rows.length > 0;
-    $("#task-empty").textContent = state.tasks.length
-      ? "No tasks match your search."
-      : "No maintenance tasks yet. Add one to get started.";
+    $("#task-table").hidden = rows.length === 0;
+    if (!ready) setEmpty("#task-empty", "Loading your tracker…", false);
+    else if (!state.tasks.length) setEmpty("#task-empty", "No maintenance tasks yet. Add your own, or start with common household tasks.", true);
+    else if (!rows.length) setEmpty("#task-empty", "No tasks match your search.", false);
+    else setEmpty("#task-empty", "", false);
   }
 
   const PROJECT_STATUS_ORDER = { "In progress": 0, Planned: 1, Idea: 2, Done: 3 };
@@ -182,13 +240,14 @@
         (a.targetDate || "9999").localeCompare(b.targetDate || "9999") ||
         a.name.localeCompare(b.name));
 
+    const today = L.todayString();
     $("#project-cards").innerHTML = list.map((p) => {
       const vendor = vendorById(p.vendorId);
       const statusClass = p.status === "Done" ? "ok" : p.status === "In progress" ? "due-soon" : "neutral";
-      const late = p.status !== "Done" && p.targetDate && L.daysBetween(L.todayString(), p.targetDate) < 0;
+      const late = p.status !== "Done" && p.targetDate && L.daysBetween(today, p.targetDate) < 0;
       const money = [
-        p.budget !== "" && p.budget != null ? `Budget ${fmtMoney(p.budget)}` : "",
-        p.actualCost !== "" && p.actualCost != null ? `Spent ${fmtMoney(p.actualCost)}` : "",
+        p.budget !== "" ? `Budget ${fmtMoney(p.budget)}` : "",
+        p.actualCost !== "" ? `Spent ${fmtMoney(p.actualCost)}` : "",
       ].filter(Boolean).join(" · ");
       return `<article class="card">
         <h3>${esc(p.name)}</h3>
@@ -201,23 +260,19 @@
         ${money ? `<div class="sub">${money}</div>` : ""}
         ${vendor ? `<div class="sub">Vendor: ${esc(vendor.name)}</div>` : ""}
         ${p.notes ? `<div class="notes">${esc(p.notes)}</div>` : ""}
-        <div class="card-actions"><button class="small" data-action="edit-project" data-id="${p.id}">Edit</button></div>
+        <div class="card-actions"><button class="small" data-action="edit-project" data-id="${esc(p.id)}" data-write>Edit</button></div>
       </article>`;
     }).join("");
 
-    $("#project-empty").hidden = list.length > 0;
-    $("#project-empty").textContent = state.projects.length ? "No projects match your search." : "No projects yet.";
+    if (!ready) setEmpty("#project-empty", "Loading…");
+    else if (!state.projects.length) setEmpty("#project-empty", "No projects yet. Add one to plan upgrades, repairs or wish-list jobs.");
+    else if (!list.length) setEmpty("#project-empty", "No projects match your search.");
+    else setEmpty("#project-empty", "");
   }
 
-  function safeUrl(url) {
-    if (!url) return "";
-    const withScheme = /^https?:\/\//i.test(url) ? url : `https://${url}`;
-    try {
-      const u = new URL(withScheme);
-      return u.protocol === "http:" || u.protocol === "https:" ? u.href : "";
-    } catch (e) {
-      return "";
-    }
+  function contactLine(value, href, label) {
+    return `<div class="contact"><a href="${esc(href)}">${esc(value)}</a>
+      <button class="copy" type="button" data-copy="${esc(value)}" aria-label="Copy ${label}">Copy</button></div>`;
   }
 
   function renderVendors() {
@@ -229,7 +284,7 @@
     $("#vendor-cards").innerHTML = list.map((v) => {
       const usedBy = state.tasks.filter((t) => t.vendorId === v.id).map((t) => t.name);
       const url = safeUrl(v.website);
-      const rating = Number(v.rating) || 0;
+      const rating = Math.min(5, Math.max(0, Math.round(Number(v.rating) || 0)));
       return `<article class="card">
         <h3>${esc(v.name)}</h3>
         <div class="meta">
@@ -237,17 +292,19 @@
           ${rating ? `<span class="stars" title="${rating} of 5">${"★".repeat(rating)}${"☆".repeat(5 - rating)}</span>` : ""}
         </div>
         ${v.contact ? `<div>${esc(v.contact)}</div>` : ""}
-        ${v.phone ? `<div><a href="tel:${esc(v.phone)}">${esc(v.phone)}</a></div>` : ""}
-        ${v.email ? `<div><a href="mailto:${esc(v.email)}">${esc(v.email)}</a></div>` : ""}
+        ${v.phone ? contactLine(v.phone, `tel:${v.phone.replace(/[^\d+]/g, "")}`, "phone number") : ""}
+        ${v.email ? contactLine(v.email, `mailto:${v.email}`, "email address") : ""}
         ${url ? `<div><a href="${esc(url)}" target="_blank" rel="noopener">${esc(v.website)}</a></div>` : ""}
         ${usedBy.length ? `<div class="sub">Handles: ${usedBy.map(esc).join(", ")}</div>` : ""}
         ${v.notes ? `<div class="notes">${esc(v.notes)}</div>` : ""}
-        <div class="card-actions"><button class="small" data-action="edit-vendor" data-id="${v.id}">Edit</button></div>
+        <div class="card-actions"><button class="small" data-action="edit-vendor" data-id="${esc(v.id)}" data-write>Edit</button></div>
       </article>`;
     }).join("");
 
-    $("#vendor-empty").hidden = list.length > 0;
-    $("#vendor-empty").textContent = state.vendors.length ? "No vendors match your search." : "No preferred vendors yet.";
+    if (!ready) setEmpty("#vendor-empty", "Loading…");
+    else if (!state.vendors.length) setEmpty("#vendor-empty", "No preferred vendors yet. Add the plumbers, electricians and other pros you trust.");
+    else if (!list.length) setEmpty("#vendor-empty", "No vendors match your search.");
+    else setEmpty("#vendor-empty", "");
   }
 
   function renderCategoryList() {
@@ -264,9 +321,9 @@
     root.querySelectorAll("[data-vendor-select]").forEach((sel) => (sel.innerHTML = options));
   }
 
-  // ---------- Generic edit dialogs ----------
+  // ---------- Add / edit dialogs ----------
 
-  function setupEditor({ dialogId, collection, defaults, beforeSave }) {
+  function setupEditor({ dialogId, kind, noun, defaults, beforeSave }) {
     const dialog = $(dialogId);
     const form = dialog.querySelector("form");
     let editingId = null;
@@ -279,6 +336,7 @@
       for (const el of form.elements) {
         if (el.name && el.name in values) el.value = values[el.name] ?? "";
       }
+      dialog.querySelector("[data-title]").textContent = `${item ? "Edit" : "Add"} ${noun}`;
       dialog.querySelector("[data-delete]").hidden = !item;
       dialog.showModal();
       form.elements[0].focus();
@@ -288,33 +346,33 @@
       e.preventDefault();
       const data = Object.fromEntries(new FormData(form).entries());
       for (const k of Object.keys(data)) if (typeof data[k] === "string") data[k] = data[k].trim();
-      const list = state[collection];
-      if (editingId) {
-        const idx = list.findIndex((x) => x.id === editingId);
-        const updated = { ...list[idx], ...data };
-        if (beforeSave) beforeSave(updated, list[idx]);
-        list[idx] = updated;
-      } else {
-        const created = { id: uid(), ...defaults(), ...data };
-        if (beforeSave) beforeSave(created, null);
-        list.push(created);
-      }
+      // Merge into the latest copy so a change someone else made meanwhile
+      // (like a logged service) isn't thrown away.
+      const existing = editingId && state[kind].find((x) => x.id === editingId);
+      const record = existing ? { ...existing, ...data } : { ...defaults(), ...data, id: editingId || S.uid() };
+      if (beforeSave) beforeSave(record);
       dialog.close();
-      save();
+      commit(store.put(kind, record));
     });
 
     dialog.querySelector("[data-cancel]").addEventListener("click", () => dialog.close());
-    dialog.querySelector("[data-delete]").addEventListener("click", () => {
-      const item = state[collection].find((x) => x.id === editingId);
-      if (!item || !confirm(`Delete "${item.name}"?`)) return;
-      state[collection] = state[collection].filter((x) => x.id !== editingId);
-      if (collection === "vendors") {
-        // Unlink the deleted vendor everywhere it was referenced.
-        state.tasks.forEach((t) => { if (t.vendorId === editingId) t.vendorId = ""; });
-        state.projects.forEach((p) => { if (p.vendorId === editingId) p.vendorId = ""; });
-      }
+    dialog.querySelector("[data-delete]").addEventListener("click", async () => {
+      const item = state[kind].find((x) => x.id === editingId);
+      if (!item) return dialog.close();
+      const ok = await askConfirm({
+        title: `Delete ${noun}?`,
+        message: `"${item.name}" will be removed${store.mode === "shared" ? " for everyone who uses this tracker" : ""}. This can't be undone.`,
+        confirmLabel: "Delete",
+      });
+      if (!ok) return;
       dialog.close();
-      save();
+      if (!(await commit(store.remove(kind, item.id)))) return;
+      if (kind === "vendors") {
+        // Unlink the deleted vendor everywhere it was referenced.
+        for (const t of state.tasks.filter((t) => t.vendorId === item.id)) await commit(store.put("tasks", { ...t, vendorId: "" }));
+        for (const p of state.projects.filter((p) => p.vendorId === item.id)) await commit(store.put("projects", { ...p, vendorId: "" }));
+      }
+      toast(`Deleted "${item.name}"`);
     });
 
     return open;
@@ -322,7 +380,8 @@
 
   const openTask = setupEditor({
     dialogId: "#task-dialog",
-    collection: "tasks",
+    kind: "tasks",
+    noun: "task",
     defaults: () => ({ name: "", category: "", location: "", frequency: 1, frequencyUnit: "months",
       lastServiced: "", vendorId: "", notes: "", history: [] }),
     beforeSave: (task) => { task.frequency = Math.max(1, parseInt(task.frequency, 10) || 1); },
@@ -330,57 +389,83 @@
 
   const openProject = setupEditor({
     dialogId: "#project-dialog",
-    collection: "projects",
+    kind: "projects",
+    noun: "project",
     defaults: () => ({ name: "", status: "Planned", priority: "Medium", targetDate: "", budget: "",
       actualCost: "", vendorId: "", notes: "" }),
   });
 
   const openVendor = setupEditor({
     dialogId: "#vendor-dialog",
-    collection: "vendors",
+    kind: "vendors",
+    noun: "vendor",
     defaults: () => ({ name: "", trade: "", contact: "", phone: "", email: "", website: "", rating: "", notes: "" }),
   });
 
-  // ---------- Log service dialog ----------
+  // ---------- Log service / history dialog ----------
 
   const serviceDialog = $("#service-dialog");
   const serviceForm = $("#service-form");
   let servicingId = null;
 
-  function openService(task) {
+  async function renderHistory(task) {
+    const list = serviceDialog.querySelector("[data-history]");
+    const history = [...task.history].sort((a, b) => b.date.localeCompare(a.date));
+    if (!history.length) {
+      list.innerHTML = '<li class="sub">No service logged yet.</li>';
+      return;
+    }
+    const ids = [...new Set(history.map((h) => h.by).filter(Boolean))];
+    let people = {};
+    try {
+      people = await store.people(ids);
+    } catch (e) {
+      /* names are a nicety; show the history without them */
+    }
+    if (servicingId !== task.id) return;
+    list.innerHTML = history.map((h) => {
+      const p = h.by && people[h.by];
+      const who = p ? (p.isMe ? "you" : p.name || "someone") : "";
+      const details = [vendorName(h.vendorId), h.notes].filter(Boolean).map(esc).join(" — ");
+      return `<li>
+        <span class="when">${fmtDate(h.date)}</span>
+        <span class="what">${details || "&nbsp;"}${who ? `<span class="by">Logged by ${esc(who)}</span>` : ""}</span>
+        <span class="cost">${h.cost !== "" ? fmtMoney(h.cost) : ""}</span>
+      </li>`;
+    }).join("");
+  }
+
+  function openService(task, { historyOnly = false } = {}) {
     servicingId = task.id;
     serviceForm.reset();
     fillVendorSelects(serviceForm);
     serviceForm.elements.date.value = L.todayString();
     serviceForm.elements.vendorId.value = task.vendorId || "";
     serviceDialog.querySelector("[data-task-name]").textContent = task.name;
-    const history = [...(task.history || [])].sort((a, b) => b.date.localeCompare(a.date));
-    serviceDialog.querySelector("[data-history]").innerHTML = history.length
-      ? history.map((h) => `<li>
-          <span class="when">${fmtDate(h.date)}</span>
-          <span class="what">${[vendorName(h.vendorId), h.notes].filter(Boolean).map(esc).join(" — ") || "&nbsp;"}</span>
-          <span>${h.cost !== "" && h.cost != null ? fmtMoney(h.cost) : ""}</span>
-        </li>`).join("")
-      : '<li class="sub">No service logged yet.</li>';
+    serviceDialog.classList.toggle("history-only", historyOnly || readOnly);
+    serviceDialog.querySelector("[data-history]").innerHTML = "";
+    renderHistory(task);
     serviceDialog.showModal();
   }
 
   serviceForm.addEventListener("submit", (e) => {
     e.preventDefault();
     const task = state.tasks.find((t) => t.id === servicingId);
-    if (!task) return serviceDialog.close();
+    serviceDialog.close();
+    if (!task) return;
     const entry = {
       date: serviceForm.elements.date.value,
       cost: serviceForm.elements.cost.value,
       vendorId: serviceForm.elements.vendorId.value,
       notes: serviceForm.elements.notes.value.trim(),
+      by: myId || "",
     };
-    task.history = [...(task.history || []), entry];
     // Last serviced is the most recent logged date, so back-dating an old
     // entry doesn't move the schedule backwards.
-    if (!task.lastServiced || entry.date > task.lastServiced) task.lastServiced = entry.date;
-    serviceDialog.close();
-    save();
+    const lastServiced = !task.lastServiced || entry.date > task.lastServiced ? entry.date : task.lastServiced;
+    commit(store.put("tasks", { ...task, history: [...task.history, entry], lastServiced })).then((ok) => {
+      if (ok) toast(`Logged "${task.name}"`);
+    });
   });
   serviceDialog.querySelector("[data-cancel]").addEventListener("click", () => serviceDialog.close());
 
@@ -388,7 +473,10 @@
 
   document.querySelectorAll(".tab").forEach((tab) =>
     tab.addEventListener("click", () => {
-      document.querySelectorAll(".tab").forEach((t) => t.classList.toggle("active", t === tab));
+      document.querySelectorAll(".tab").forEach((t) => {
+        t.classList.toggle("active", t === tab);
+        t.setAttribute("aria-selected", t === tab);
+      });
       document.querySelectorAll(".view").forEach((v) => (v.hidden = v.id !== `view-${tab.dataset.view}`));
     })
   );
@@ -409,42 +497,122 @@
     renderTasks();
   });
 
-  document.addEventListener("click", (e) => {
+  function copyText(btn) {
+    const text = btn.dataset.copy;
+    const fallback = () => {
+      // Select the text so it can be copied by hand.
+      const target = btn.parentElement.querySelector("a");
+      const range = document.createRange();
+      range.selectNodeContents(target);
+      const sel = window.getSelection();
+      sel.removeAllRanges();
+      sel.addRange(range);
+      toast("Selected. Copy it with your device's copy command.");
+    };
+    if (!navigator.clipboard || !navigator.clipboard.writeText) return fallback();
+    navigator.clipboard.writeText(text).then(() => toast(`Copied ${text}`), fallback);
+  }
+
+  document.addEventListener("click", async (e) => {
+    const copyBtn = e.target.closest("[data-copy]");
+    if (copyBtn) return copyText(copyBtn);
     const btn = e.target.closest("[data-action]");
     if (!btn) return;
     const id = btn.dataset.id;
+    const task = () => state.tasks.find((t) => t.id === id);
     switch (btn.dataset.action) {
-      case "service": openService(state.tasks.find((t) => t.id === id)); break;
-      case "edit-task": openTask(state.tasks.find((t) => t.id === id)); break;
+      case "service": if (task()) openService(task()); break;
+      case "history": if (task()) openService(task(), { historyOnly: true }); break;
+      case "edit-task": if (task()) openTask(task()); break;
       case "edit-project": openProject(state.projects.find((p) => p.id === id)); break;
       case "edit-vendor": openVendor(state.vendors.find((v) => v.id === id)); break;
+      case "add-starters": {
+        btn.disabled = true;
+        for (const t of starterTasks()) if (!(await commit(store.put("tasks", t)))) break;
+        btn.disabled = false;
+        break;
+      }
     }
   });
 
-  $("#export-data").addEventListener("click", () => {
-    const blob = new Blob([JSON.stringify(state, null, 2)], { type: "application/json" });
-    const a = document.createElement("a");
-    a.href = URL.createObjectURL(blob);
-    a.download = `house-maintenance-${L.todayString()}.json`;
-    a.click();
-    URL.revokeObjectURL(a.href);
+  $("#export-data").addEventListener("click", async () => {
+    if (!store || store.mode === "unavailable") return;
+    const json = JSON.stringify(state, null, 2);
+    try {
+      await store.saveFile(`house-maintenance-${L.todayString()}.json`, json);
+    } catch (err) {
+      if (err && err.code !== "declined") toast("The backup couldn't be saved. Try again.", "error");
+    }
   });
 
   $("#import-data").addEventListener("change", async (e) => {
     const file = e.target.files[0];
     e.target.value = "";
-    if (!file) return;
+    if (!file || !store) return;
+    let data;
     try {
-      const data = JSON.parse(await file.text());
-      if (!data || !Array.isArray(data.tasks)) throw new Error("Not a tracker backup file");
-      if (!confirm("Replace all current data with this backup?")) return;
-      state = normalize(data);
-      save();
+      data = JSON.parse(await file.text());
+      if (!data || !Array.isArray(data.tasks)) throw new Error("not a backup");
     } catch (err) {
-      alert(`Import failed: ${err.message}`);
+      toast("That file isn't a House Maintenance backup. Choose a .json file made with Export backup.", "error");
+      return;
     }
+    const ok = await askConfirm({
+      title: "Replace all data?",
+      message: `Everything in this tracker will be replaced with the ${data.tasks.length} tasks and other items in "${file.name}"${store.mode === "shared" ? ", for everyone who uses it" : ""}.`,
+      confirmLabel: "Replace",
+    });
+    if (!ok) return;
+    if (await commit(store.replaceAll(data))) toast("Backup imported");
   });
 
-  // Persist the starter tasks on first run, then draw.
-  save();
+  // ---------- Start ----------
+
+  async function start() {
+    render();
+    store = await S.open({ win: window, storage: safeLocalStorage(), starter: starterTasks });
+
+    if (store.mode === "unavailable") {
+      // Inside Claude, but the shared data isn't reachable (usually signed out).
+      document.body.classList.add("no-data");
+      showBanner("The shared tracker couldn't load here. Open it from your Claude link while signed in to Claude.");
+      return;
+    }
+
+    $("#storage-note").textContent = store.mode === "shared"
+      ? "Shared: changes sync for everyone who has access."
+      : "Saved in this browser only.";
+    $("#mode-chip").hidden = store.mode !== "shared";
+    $("#export-data").hidden = true;
+    store.canSaveFile().then((ok) => ($("#export-data").hidden = !ok));
+
+    store.subscribe(
+      (next) => {
+        state = next;
+        ready = true;
+        document.body.classList.add("ready");
+        render();
+      },
+      (err) => {
+        console.error(err);
+        showBanner(err && err.code === "revoked"
+          ? "Your access to this tracker changed. Reload the page to continue."
+          : "Live updates stopped. Reload the page to see the latest changes.");
+      }
+    );
+
+    const [canWrite, me] = await Promise.all([store.canWrite(), store.me()]);
+    myId = me;
+    if (canWrite === false) setReadOnly(true);
+  }
+
+  function safeLocalStorage() {
+    try {
+      return window.localStorage;
+    } catch (e) {
+      return null;
+    }
+  }
+
+  start();
 })();

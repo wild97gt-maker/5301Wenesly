@@ -2,36 +2,41 @@
 <html lang="en">
 <head>
   <meta charset="utf-8" />
-  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover" />
   <title>House Maintenance Tracker</title>
   <link rel="stylesheet" href="styles.css" />
 </head>
 <body>
   <header class="app-header">
-    <h1>🏠 House Maintenance</h1>
+    <div class="title-row">
+      <h1>🏠 House Maintenance</h1>
+      <span class="chip" id="mode-chip" hidden><span class="dot" aria-hidden="true"></span>Shared</span>
+    </div>
     <nav class="tabs" role="tablist">
-      <button class="tab active" data-view="maintenance" role="tab">Maintenance</button>
-      <button class="tab" data-view="projects" role="tab">Projects</button>
-      <button class="tab" data-view="vendors" role="tab">Vendors</button>
+      <button class="tab active" data-view="maintenance" role="tab" aria-selected="true">Maintenance</button>
+      <button class="tab" data-view="projects" role="tab" aria-selected="false">Projects</button>
+      <button class="tab" data-view="vendors" role="tab" aria-selected="false">Vendors</button>
     </nav>
   </header>
 
   <main>
+    <p class="banner" id="banner" role="status" hidden></p>
+
     <!-- Maintenance -->
     <section id="view-maintenance" class="view">
       <div class="summary" id="summary"></div>
       <div class="toolbar">
-        <input type="search" id="task-search" placeholder="Search tasks…" />
-        <select id="task-filter">
+        <input type="search" id="task-search" placeholder="Search tasks…" aria-label="Search tasks" />
+        <select id="task-filter" aria-label="Filter by status">
           <option value="all">All statuses</option>
           <option value="overdue">Overdue</option>
           <option value="due-soon">Due soon</option>
           <option value="never">Not yet serviced</option>
           <option value="ok">Up to date</option>
         </select>
-        <button class="primary" id="add-task">+ Add task</button>
+        <button class="primary" id="add-task" data-write>+ Add task</button>
       </div>
-      <div class="table-wrap">
+      <div class="table-wrap" id="task-table">
         <table class="data">
           <thead>
             <tr>
@@ -41,62 +46,67 @@
               <th>Next due</th>
               <th>Status</th>
               <th>Vendor</th>
-              <th></th>
+              <th><span class="visually-hidden">Actions</span></th>
             </tr>
           </thead>
           <tbody id="task-rows"></tbody>
         </table>
       </div>
-      <p class="empty" id="task-empty" hidden>No maintenance tasks yet. Add one to get started.</p>
+      <div class="empty" id="task-empty" hidden>
+        <p data-msg></p>
+        <button data-action="add-starters" data-write hidden>Add 8 common household tasks</button>
+      </div>
     </section>
 
     <!-- Projects -->
     <section id="view-projects" class="view" hidden>
       <div class="toolbar">
-        <input type="search" id="project-search" placeholder="Search projects…" />
-        <select id="project-filter">
+        <input type="search" id="project-search" placeholder="Search projects…" aria-label="Search projects" />
+        <select id="project-filter" aria-label="Filter by status">
           <option value="all">All statuses</option>
           <option value="Idea">Idea</option>
           <option value="Planned">Planned</option>
           <option value="In progress">In progress</option>
           <option value="Done">Done</option>
         </select>
-        <button class="primary" id="add-project">+ Add project</button>
+        <button class="primary" id="add-project" data-write>+ Add project</button>
       </div>
       <div class="cards" id="project-cards"></div>
-      <p class="empty" id="project-empty" hidden>No projects yet.</p>
+      <div class="empty" id="project-empty" hidden><p data-msg></p></div>
     </section>
 
     <!-- Vendors -->
     <section id="view-vendors" class="view" hidden>
       <div class="toolbar">
-        <input type="search" id="vendor-search" placeholder="Search vendors…" />
-        <button class="primary" id="add-vendor">+ Add vendor</button>
+        <input type="search" id="vendor-search" placeholder="Search vendors…" aria-label="Search vendors" />
+        <button class="primary" id="add-vendor" data-write>+ Add vendor</button>
       </div>
       <div class="cards" id="vendor-cards"></div>
-      <p class="empty" id="vendor-empty" hidden>No preferred vendors yet.</p>
+      <div class="empty" id="vendor-empty" hidden><p data-msg></p></div>
     </section>
   </main>
 
   <footer class="app-footer">
-    <span>Data is saved in this browser.</span>
+    <span id="storage-note"></span>
     <button class="link" id="export-data">Export backup</button>
-    <label class="link">Import backup<input type="file" id="import-data" accept="application/json" hidden /></label>
+    <label class="link" data-write>Import backup<input type="file" id="import-data" accept="application/json,.json" hidden /></label>
   </footer>
+
+  <div class="toast" id="toast" role="status" aria-live="polite" hidden></div>
 
   <!-- Task dialog -->
   <dialog id="task-dialog">
-    <form method="dialog" id="task-form">
-      <h2 data-title>Maintenance task</h2>
-      <label>Task name<input name="name" required placeholder="e.g. Replace HVAC filter" /></label>
+    <form id="task-form">
+      <h2 data-title>Add task</h2>
+      <label>Task name<input id="task-name" name="name" required placeholder="e.g. Replace HVAC filter" /></label>
       <div class="row">
-        <label>Category<input name="category" list="category-list" placeholder="e.g. HVAC" /></label>
-        <label>Location<input name="location" placeholder="e.g. Basement" /></label>
+        <label>Category<input id="task-category" name="category" list="category-list" placeholder="e.g. HVAC" /></label>
+        <label>Location<input id="task-location" name="location" placeholder="e.g. Basement" /></label>
       </div>
       <div class="row">
-        <label>Every<input name="frequency" type="number" min="1" step="1" required value="1" /></label>
+        <label>Every<input id="task-frequency" name="frequency" type="number" min="1" step="1" required value="1" /></label>
         <label>Unit
-          <select name="frequencyUnit">
+          <select id="task-unit" name="frequencyUnit">
             <option value="days">Days</option>
             <option value="weeks">Weeks</option>
             <option value="months" selected>Months</option>
@@ -104,9 +114,9 @@
           </select>
         </label>
       </div>
-      <label>Last serviced<input name="lastServiced" type="date" /></label>
-      <label>Preferred vendor<select name="vendorId" data-vendor-select></select></label>
-      <label>Notes<textarea name="notes" rows="3" placeholder="Filter size, model numbers, etc."></textarea></label>
+      <label>Last serviced<input id="task-last" name="lastServiced" type="date" /></label>
+      <label>Preferred vendor<select id="task-vendor" name="vendorId" data-vendor-select></select></label>
+      <label>Notes<textarea id="task-notes" name="notes" rows="3" placeholder="Filter size, model numbers, etc."></textarea></label>
       <div class="dialog-actions">
         <button type="button" class="danger" data-delete hidden>Delete</button>
         <span class="spacer"></span>
@@ -116,34 +126,36 @@
     </form>
   </dialog>
 
-  <!-- Log service dialog -->
+  <!-- Log service / history dialog -->
   <dialog id="service-dialog">
-    <form method="dialog" id="service-form">
-      <h2>Log service: <span data-task-name></span></h2>
-      <label>Date serviced<input name="date" type="date" required /></label>
-      <div class="row">
-        <label>Cost<input name="cost" type="number" min="0" step="0.01" placeholder="0.00" /></label>
-        <label>Done by<select name="vendorId" data-vendor-select></select></label>
+    <form id="service-form">
+      <h2><span class="log-only">Log service: </span><span class="history-title">History: </span><span data-task-name></span></h2>
+      <div class="log-fields">
+        <label>Date serviced<input id="service-date" name="date" type="date" required /></label>
+        <div class="row">
+          <label>Cost<input id="service-cost" name="cost" type="number" min="0" step="0.01" placeholder="0.00" /></label>
+          <label>Done by<select id="service-vendor" name="vendorId" data-vendor-select></select></label>
+        </div>
+        <label>Notes<textarea id="service-notes" name="notes" rows="2"></textarea></label>
+        <h3>History</h3>
       </div>
-      <label>Notes<textarea name="notes" rows="2"></textarea></label>
-      <h3>History</h3>
       <ul class="history" data-history></ul>
       <div class="dialog-actions">
         <span class="spacer"></span>
-        <button type="button" data-cancel>Cancel</button>
-        <button type="submit" class="primary">Log service</button>
+        <button type="button" data-cancel>Close</button>
+        <button type="submit" class="primary log-only">Log service</button>
       </div>
     </form>
   </dialog>
 
   <!-- Project dialog -->
   <dialog id="project-dialog">
-    <form method="dialog" id="project-form">
-      <h2>Project</h2>
-      <label>Project name<input name="name" required placeholder="e.g. Repaint deck" /></label>
+    <form id="project-form">
+      <h2 data-title>Add project</h2>
+      <label>Project name<input id="project-name" name="name" required placeholder="e.g. Repaint deck" /></label>
       <div class="row">
         <label>Status
-          <select name="status">
+          <select id="project-status" name="status">
             <option>Idea</option>
             <option selected>Planned</option>
             <option>In progress</option>
@@ -151,7 +163,7 @@
           </select>
         </label>
         <label>Priority
-          <select name="priority">
+          <select id="project-priority" name="priority">
             <option>Low</option>
             <option selected>Medium</option>
             <option>High</option>
@@ -159,14 +171,14 @@
         </label>
       </div>
       <div class="row">
-        <label>Target date<input name="targetDate" type="date" /></label>
-        <label>Budget<input name="budget" type="number" min="0" step="0.01" /></label>
+        <label>Target date<input id="project-target" name="targetDate" type="date" /></label>
+        <label>Budget<input id="project-budget" name="budget" type="number" min="0" step="0.01" /></label>
       </div>
       <div class="row">
-        <label>Actual cost<input name="actualCost" type="number" min="0" step="0.01" /></label>
-        <label>Vendor<select name="vendorId" data-vendor-select></select></label>
+        <label>Actual cost<input id="project-cost" name="actualCost" type="number" min="0" step="0.01" /></label>
+        <label>Vendor<select id="project-vendor" name="vendorId" data-vendor-select></select></label>
       </div>
-      <label>Notes<textarea name="notes" rows="3"></textarea></label>
+      <label>Notes<textarea id="project-notes" name="notes" rows="3"></textarea></label>
       <div class="dialog-actions">
         <button type="button" class="danger" data-delete hidden>Delete</button>
         <span class="spacer"></span>
@@ -178,20 +190,20 @@
 
   <!-- Vendor dialog -->
   <dialog id="vendor-dialog">
-    <form method="dialog" id="vendor-form">
-      <h2>Vendor</h2>
-      <label>Name / company<input name="name" required /></label>
+    <form id="vendor-form">
+      <h2 data-title>Add vendor</h2>
+      <label>Name / company<input id="vendor-name" name="name" required /></label>
       <div class="row">
-        <label>Trade<input name="trade" list="trade-list" placeholder="e.g. Plumber" /></label>
-        <label>Contact person<input name="contact" /></label>
+        <label>Trade<input id="vendor-trade" name="trade" list="trade-list" placeholder="e.g. Plumber" /></label>
+        <label>Contact person<input id="vendor-contact" name="contact" /></label>
       </div>
       <div class="row">
-        <label>Phone<input name="phone" type="tel" /></label>
-        <label>Email<input name="email" type="email" /></label>
+        <label>Phone<input id="vendor-phone" name="phone" type="tel" /></label>
+        <label>Email<input id="vendor-email" name="email" type="email" /></label>
       </div>
-      <label>Website<input name="website" placeholder="e.g. acmeplumbing.com" /></label>
+      <label>Website<input id="vendor-website" name="website" placeholder="e.g. acmeplumbing.com" /></label>
       <label>Rating
-        <select name="rating">
+        <select id="vendor-rating" name="rating">
           <option value="">—</option>
           <option value="5">★★★★★</option>
           <option value="4">★★★★</option>
@@ -200,12 +212,25 @@
           <option value="1">★</option>
         </select>
       </label>
-      <label>Notes<textarea name="notes" rows="3" placeholder="Pricing, availability, past work…"></textarea></label>
+      <label>Notes<textarea id="vendor-notes" name="notes" rows="3" placeholder="Pricing, availability, past work…"></textarea></label>
       <div class="dialog-actions">
         <button type="button" class="danger" data-delete hidden>Delete</button>
         <span class="spacer"></span>
         <button type="button" data-cancel>Cancel</button>
         <button type="submit" class="primary">Save</button>
+      </div>
+    </form>
+  </dialog>
+
+  <!-- Confirmation dialog (alert/confirm don't work inside Claude's viewer) -->
+  <dialog id="confirm-dialog" class="confirm">
+    <form id="confirm-form">
+      <h2 data-confirm-title></h2>
+      <p data-confirm-message></p>
+      <div class="dialog-actions">
+        <span class="spacer"></span>
+        <button type="button" data-cancel>Cancel</button>
+        <button type="submit" class="danger solid" data-confirm-ok>Delete</button>
       </div>
     </form>
   </dialog>
@@ -218,6 +243,7 @@
   </datalist>
 
   <script src="js/logic.js"></script>
+  <script src="js/store.js"></script>
   <script src="js/app.js"></script>
 </body>
 </html>
