@@ -1,6 +1,4 @@
-/* Light palette on :root; dark palette for the OS setting (unless the page is
-   forced light) and again for an explicit data-theme="dark" (Claude's viewer
-   sets data-theme when someone picks a theme by hand). */
+/* Light palette by default; dark palette when the device is in dark mode. */
 :root {
   --bg: #f6f7f9;
   --surface: #ffffff;
@@ -29,7 +27,7 @@
 }
 
 @media (prefers-color-scheme: dark) {
-  :root:not([data-theme="light"]) {
+  :root {
     --bg: #14171c;
     --surface: #1d2129;
     --text: #e7eaf0;
@@ -54,32 +52,6 @@
     --toast-fg: #14171c;
     color-scheme: dark;
   }
-}
-
-:root[data-theme="dark"] {
-  --bg: #14171c;
-  --surface: #1d2129;
-  --text: #e7eaf0;
-  --muted: #9aa3b2;
-  --border: #2e3440;
-  --primary: #5b8ff0;
-  --primary-text: #0d1320;
-  --danger: #ef6b62;
-  --danger-text: #1a0b0a;
-  --overdue-bg: #4a1f1d;
-  --overdue-fg: #ffb3ad;
-  --soon-bg: #45360f;
-  --soon-fg: #ffd77a;
-  --ok-bg: #1b3a25;
-  --ok-fg: #95e0ac;
-  --never-bg: #2a303b;
-  --never-fg: #c3cad6;
-  --star: #f2c14e;
-  --banner-bg: #1c2a44;
-  --banner-fg: #b9cdf5;
-  --toast-bg: #e7eaf0;
-  --toast-fg: #14171c;
-  color-scheme: dark;
 }
 
 [hidden] { display: none !important; }
@@ -116,6 +88,8 @@ body {
   font-weight: 600;
 }
 .chip .dot { width: 7px; height: 7px; border-radius: 50%; background: currentColor; }
+.chip.offline { background: var(--never-bg); color: var(--never-fg); }
+.title-row button { padding: 6px 14px; }
 
 .tabs { display: flex; gap: 4px; }
 .tab {
@@ -265,10 +239,10 @@ button.copy {
   white-space: nowrap;
 }
 
-/* Edit controls wait for the data, and disappear for view-only access. */
+/* Edit controls wait for the data, and disappear when edits can't be saved. */
 body:not(.ready) [data-write] { visibility: hidden; }
-.read-only [data-write] { display: none !important; }
-.no-data .view, .no-data .app-footer { display: none !important; }
+.read-only [data-write], .missing [data-write] { display: none !important; }
+body:not(.shared) .log-name { display: none; }
 
 .app-footer {
   max-width: 1100px;
@@ -326,3 +300,11 @@ dialog p { margin: 0; }
   table.data td[data-label]::before { content: attr(data-label) ": "; color: var(--muted); font-size: 0.85rem; }
   .actions { justify-content: flex-start; padding-top: 6px; }
 }
+
+/* Share dialog: one dialog, two states (not shared yet / shared). */
+#share-dialog:not(.is-shared) .when-shared,
+#share-dialog.is-shared .when-local { display: none; }
+.share-body { display: flex; flex-direction: column; gap: 12px; align-items: flex-start; }
+.share-body > label { align-self: stretch; }
+#share-link { font-size: 0.9rem; }
+.share-error { margin: 0; color: var(--danger); }

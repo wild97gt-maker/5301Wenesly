@@ -3,6 +3,9 @@ const assert = require("node:assert/strict");
 const S = require("../js/store.js");
 
 const tick = () => new Promise((resolve) => setTimeout(resolve, 0));
+const KEY = "AbCdEfGhIjKlMnOpQrStUv"; // 22 chars, like a real household key
+const BASE = "https://example-default-rtdb.firebaseio.com/";
+const ROOT = `https://example-default-rtdb.firebaseio.com/households/${KEY}`;
 
 // In-memory stand-in for localStorage.
 function memoryStorage(initial = {}) {
@@ -18,86 +21,80 @@ function memoryStorage(initial = {}) {
   };
 }
 
-// In-memory stand-in for the Claude artifact `db` capability: collections of
-// JSON documents, onSnapshot listeners, and injectable failures.
-function fakeDb({ cacheFirst = false, cacheOnly = false } = {}) {
-  const data = { tasks: new Map(), projects: new Map(), vendors: new Map() };
-  const subs = { tasks: [], projects: [], vendors: [] };
+// Stand-in for the browser's EventSource, driven by the test.
+class FakeEventSource {
+  constructor(url) {
+    this.url = url;
+    this.readyState = 0;
+    this.listeners = {};
+    this.closed = false;
+    FakeEventSource.instances.push(this);
+  }
+  addEventListener(type, fn) {
+    (this.listeners[type] = this.listeners[type] || []).push(fn);
+  }
+  // Deliver a Firebase streaming event ("put", "patch", "cancel", ...).
+  send(type, payload) {
+    this.readyState = 1;
+    (this.listeners[type] || []).forEach((fn) => fn({ data: JSON.stringify(payload) }));
+  }
+  // closed=true: the browser gave up; false: it is reconnecting by itself.
+  fail(closed) {
+    this.readyState = closed ? 2 : 0;
+    if (this.onerror) this.onerror({});
+  }
+  close() {
+    this.readyState = 2;
+    this.closed = true;
+  }
+}
+FakeEventSource.instances = [];
+
+// Stand-in for fetch: records each request and answers with handler().
+function fakeFetch(handler = () => ({ status: 204 })) {
   const calls = [];
-  const failures = [];
-
-  function snapshot(kind) {
-    const docs = [...data[kind].keys()].sort().map((id) => {
-      const body = Object.freeze(JSON.parse(JSON.stringify(data[kind].get(id))));
-      return { id, exists: true, data: () => body, metadata: { fromCache: false, hasPendingWrites: false } };
-    });
-    return { docs, size: docs.length, empty: docs.length === 0, metadata: { fromCache: false, hasPendingWrites: false } };
-  }
-
-  function notify(kind) {
-    subs[kind].forEach((s) => s.next(snapshot(kind)));
-  }
-
-  function maybeFail(op) {
-    const i = failures.findIndex((f) => f.op === op);
-    if (i !== -1) {
-      const [f] = failures.splice(i, 1);
-      throw { code: f.code, message: f.code };
-    }
-  }
-
-  return {
-    data,
-    calls,
-    subs,
-    fail(op, code) {
-      failures.push({ op, code });
-    },
-    // A write made by someone else (the other person's browser).
-    external(kind, id, body) {
-      if (body === null) data[kind].delete(id);
-      else data[kind].set(id, body);
-      notify(kind);
-    },
-    collection(kind) {
-      return {
-        doc(id) {
-          if (!S.isValidId(id)) throw new TypeError(`bad document id: ${id}`);
-          return {
-            async set(body) {
-              calls.push(["set", kind, id, body]);
-              maybeFail("set");
-              data[kind].set(id, body);
-              notify(kind);
-            },
-            async delete() {
-              calls.push(["delete", kind, id]);
-              maybeFail("delete");
-              data[kind].delete(id);
-              notify(kind);
-            },
-          };
-        },
-        onSnapshot(next, error) {
-          const sub = { next, error };
-          subs[kind].push(sub);
-          const cached = { docs: [], size: 0, empty: true, metadata: { fromCache: true, hasPendingWrites: false } };
-          if (cacheOnly) {
-            setTimeout(() => next(cached), 0);
-          } else if (cacheFirst) {
-            setTimeout(() => next(cached), 0);
-            setTimeout(() => setTimeout(() => next(snapshot(kind)), 0), 0);
-          } else {
-            setTimeout(() => next(snapshot(kind)), 0);
-          }
-          return () => subs[kind].splice(subs[kind].indexOf(sub), 1);
-        },
-      };
-    },
+  const fn = async (url, opts = {}) => {
+    const call = { url, method: opts.method || "GET", body: opts.body === undefined ? undefined : JSON.parse(opts.body) };
+    calls.push(call);
+    const r = await handler(call);
+    if (r === "network-error") throw new TypeError("Failed to fetch");
+    return { ok: r.status >= 200 && r.status < 300, status: r.status, json: async () => (r.body === undefined ? null : r.body) };
   };
+  fn.calls = calls;
+  return fn;
 }
 
-// ---------- normalize ----------
+// A Firebase store wired to fakes, with timers the test can run by hand.
+function firebaseStore(fetchImpl = fakeFetch()) {
+  FakeEventSource.instances = [];
+  const timers = [];
+  const store = S.createFirebaseStore({
+    baseUrl: BASE,
+    key: KEY,
+    fetchImpl,
+    EventSourceImpl: FakeEventSource,
+    setTimer: (fn, ms) => (timers.push({ fn, ms }), timers.length),
+    clearTimer: () => {},
+  });
+  const updates = [];
+  const statuses = [];
+  store.subscribe((state, info) => updates.push({ state, info }), (s) => statuses.push(s));
+  const es = () => FakeEventSource.instances.at(-1);
+  const latest = () => updates.at(-1).state;
+  const runTimers = async () => {
+    const due = timers.splice(0);
+    for (const t of due) await t.fn();
+  };
+  return { store, updates, statuses, es, latest, timers, runTimers, fetchImpl };
+}
+
+const HOUSEHOLD = {
+  meta: { createdAt: "2026-10-06T00:00:00Z" },
+  tasks: { t1: { name: "Replace HVAC filter", frequency: 3, frequencyUnit: "months", lastServiced: "2026-09-01" } },
+  vendors: { v1: { name: "Ace Heating", trade: "HVAC" } },
+};
+
+// ---------- normalize & helpers ----------
 
 test("normalize cleans records from untrusted input", () => {
   const s = S.normalize({
@@ -127,16 +124,31 @@ test("normalize cleans records from untrusted input", () => {
   assert.equal("extra" in s, false);
 });
 
-test("cleanItem keeps unknown fields and fills defaults", () => {
-  const t = S.cleanItem("tasks", { name: "", future: "kept" }, "t1");
+test("cleanItem keeps unknown fields, fills defaults, and reads list-shaped objects", () => {
+  const t = S.cleanItem("tasks", { name: "", future: "kept", history: { 0: { date: "2026-02-01" } } }, "t1");
   assert.equal(t.id, "t1");
   assert.equal(t.name, "Untitled");
   assert.equal(t.future, "kept");
-  assert.deepEqual(t.history, []);
+  assert.equal(t.history.length, 1);
+  assert.equal(t.history[0].date, "2026-02-01");
 });
 
-test("toDoc drops the id and undefined values", () => {
-  assert.deepEqual(S.toDoc({ id: "a", name: "x", gone: undefined }), { name: "x" });
+test("toDoc drops the id, undefined values and keys Firebase rejects", () => {
+  assert.deepEqual(S.toDoc({ id: "a", name: "x", gone: undefined, "bad.key": 1, nested: { "a/b": 2, ok: 3 } }), {
+    name: "x",
+    nested: { ok: 3 },
+  });
+});
+
+test("household keys are long, random and URL-safe", () => {
+  const a = S.newHouseholdKey();
+  const b = S.newHouseholdKey();
+  assert.match(a, /^[A-Za-z0-9_-]{22}$/);
+  assert.notEqual(a, b);
+  assert.ok(S.isHouseholdKey(a));
+  assert.equal(S.isHouseholdKey("short"), false);
+  assert.equal(S.isHouseholdKey("has/slash/and-is-long-enough"), false);
+  assert.throws(() => S.createFirebaseStore({ baseUrl: BASE, key: "short" }), TypeError);
 });
 
 // ---------- local store ----------
@@ -203,149 +215,198 @@ test("local store follows changes made in another tab", () => {
   assert.equal(seen.tasks.length, 1);
 });
 
-// ---------- shared store ----------
+// ---------- Firebase store: reading ----------
 
-test("shared store waits for every list, then follows live changes", async () => {
-  const db = fakeDb();
-  db.data.tasks.set("t1", { name: "Clean gutters", frequency: 6, frequencyUnit: "months" });
-  const store = S.createSharedStore({ db });
-  const updates = [];
-  store.subscribe((s) => updates.push(s));
-  assert.equal(updates.length, 0, "nothing before data arrives");
-  await tick();
-  assert.equal(updates.length, 1, "one update once all three lists loaded");
-  assert.equal(updates[0].tasks[0].id, "t1");
-  assert.equal(updates[0].tasks[0].name, "Clean gutters");
+test("firebase store streams the household and applies put and patch events", () => {
+  const f = firebaseStore();
+  assert.equal(f.es().url, `${ROOT}.json`);
+  assert.equal(f.updates.length, 0, "nothing shown before data arrives");
 
-  db.external("vendors", "v1", { name: "Ace", trade: "HVAC" });
-  assert.equal(updates.at(-1).vendors[0].name, "Ace");
-  db.external("tasks", "t1", null);
-  assert.equal(updates.at(-1).tasks.length, 0);
+  f.es().send("put", { path: "/", data: HOUSEHOLD });
+  assert.equal(f.updates.at(-1).info.exists, true);
+  assert.deepEqual(f.statuses, ["live"]);
+  assert.equal(f.latest().tasks[0].id, "t1");
+  assert.equal(f.latest().vendors[0].name, "Ace Heating");
+
+  // Someone else adds a project, then edits and removes things.
+  f.es().send("put", { path: "/projects/p1", data: { name: "Repaint deck", status: "Planned" } });
+  assert.equal(f.latest().projects[0].name, "Repaint deck");
+  f.es().send("patch", { path: "/tasks/t1", data: { lastServiced: "2026-10-01", notes: "16x25x1" } });
+  assert.equal(f.latest().tasks[0].lastServiced, "2026-10-01");
+  assert.equal(f.latest().tasks[0].name, "Replace HVAC filter", "patch keeps other fields");
+  f.es().send("put", { path: "/vendors/v1", data: null });
+  assert.equal(f.latest().vendors.length, 0);
+  f.es().send("keep-alive", null);
+  f.es().send("put", { path: "/tasks/bad id!", data: { name: "skipped" } });
+  assert.equal(f.latest().tasks.length, 1, "records with unusable ids are ignored");
 });
 
-test("shared store writes documents named by id", async () => {
-  const db = fakeDb();
-  const store = S.createSharedStore({ db });
+test("firebase store reports a household that doesn't exist", () => {
+  const f = firebaseStore();
+  f.es().send("put", { path: "/", data: null });
+  assert.equal(f.updates.at(-1).info.exists, false);
+  assert.deepEqual(f.latest(), S.emptyState());
+});
+
+test("firebase store ignores malformed stream messages", () => {
+  const f = firebaseStore();
+  f.es().send("put", { path: "/", data: HOUSEHOLD });
+  const count = f.updates.length;
+  f.es().listeners.put[0]({ data: "{not json" });
+  f.es().listeners.put[0]({ data: JSON.stringify({ data: 1 }) });
+  assert.equal(f.updates.length, count);
+});
+
+// ---------- Firebase store: writing ----------
+
+test("put shows the change at once and writes the record at its own path", async () => {
+  const f = firebaseStore();
+  f.es().send("put", { path: "/", data: HOUSEHOLD });
+  const pending = f.store.put("tasks", { id: "t9", name: "Clean gutters", frequency: 6, frequencyUnit: "months", history: [] });
+  assert.ok(f.latest().tasks.some((t) => t.id === "t9"), "visible before the server answers");
+  await pending;
+  const call = f.fetchImpl.calls.at(-1);
+  assert.equal(call.method, "PUT");
+  assert.equal(call.url, `${ROOT}/tasks/t9.json?print=silent`);
+  assert.equal("id" in call.body, false);
+  assert.equal(call.body.name, "Clean gutters");
+});
+
+test("remove deletes the record's path", async () => {
+  const f = firebaseStore();
+  f.es().send("put", { path: "/", data: HOUSEHOLD });
+  await f.store.remove("vendors", "v1");
+  assert.deepEqual(f.fetchImpl.calls.at(-1), { url: `${ROOT}/vendors/v1.json?print=silent`, method: "DELETE", body: undefined });
+  assert.equal(f.latest().vendors.length, 0);
+});
+
+test("replaceAll writes the whole household and keeps its meta", async () => {
+  const f = firebaseStore();
+  f.es().send("put", { path: "/", data: HOUSEHOLD });
+  await f.store.replaceAll({ tasks: [{ id: "n1", name: "Imported" }], vendors: [] });
+  const call = f.fetchImpl.calls.at(-1);
+  assert.equal(call.url, `${ROOT}.json?print=silent`);
+  assert.deepEqual(call.body.meta, HOUSEHOLD.meta);
+  assert.deepEqual(Object.keys(call.body.tasks), ["n1"]);
+  assert.deepEqual(f.latest().tasks.map((t) => t.name), ["Imported"]);
+  assert.equal(f.latest().vendors.length, 0);
+});
+
+test("a refused write is undone on screen and explained", async () => {
+  const f = firebaseStore(fakeFetch((call) => (call.method === "GET" ? { status: 200, body: HOUSEHOLD } : { status: 401 })));
+  f.es().send("put", { path: "/", data: HOUSEHOLD });
+  const pending = f.store.put("tasks", { id: "t1", name: "Renamed" });
+  assert.equal(f.latest().tasks[0].name, "Renamed");
+  await assert.rejects(pending, (e) => e.code === "denied" && /rules/.test(e.message));
+  assert.equal(f.latest().tasks[0].name, "Replace HVAC filter");
+});
+
+test("an offline write is undone on screen", async () => {
+  const f = firebaseStore(fakeFetch(() => "network-error"));
+  f.es().send("put", { path: "/", data: HOUSEHOLD });
+  await assert.rejects(f.store.remove("tasks", "t1"), (e) => e.code === "offline");
+  assert.equal(f.latest().tasks.length, 1);
+});
+
+test("a server error is retried once", async () => {
+  let puts = 0;
+  const flaky = firebaseStore(fakeFetch((call) => (call.method === "PUT" && ++puts === 1 ? { status: 503 } : { status: 204 })));
+  flaky.es().send("put", { path: "/", data: HOUSEHOLD });
+  const pending = flaky.store.put("vendors", { id: "v2", name: "Bob's Plumbing" });
+  await tick();
+  await flaky.runTimers(); // the pause before retrying
+  await pending;
+  assert.equal(puts, 2);
+
+  const down = firebaseStore(fakeFetch((call) => (call.method === "PUT" ? { status: 500 } : { status: 200, body: HOUSEHOLD })));
+  down.es().send("put", { path: "/", data: HOUSEHOLD });
+  const failing = down.store.put("vendors", { id: "v3", name: "Never saved" });
+  await tick();
+  await down.runTimers();
+  await assert.rejects(failing, (e) => e.code === "unavailable");
+  assert.equal(down.latest().vendors.some((v) => v.id === "v3"), false);
+});
+
+// ---------- Firebase store: connection problems ----------
+
+test("a dropped connection shows offline, refreshes, and reconnects", async () => {
+  const f = firebaseStore(fakeFetch(() => ({ status: 200, body: { ...HOUSEHOLD, projects: { p1: { name: "From refresh" } } } })));
+  const first = f.es();
+  first.send("put", { path: "/", data: HOUSEHOLD });
+
+  // The browser is reconnecting on its own: just show offline.
+  first.fail(false);
+  assert.deepEqual(f.statuses, ["live", "offline"]);
+  assert.equal(FakeEventSource.instances.length, 1);
+
+  // The browser gave up: fetch the latest data and try again later.
+  first.fail(true);
+  await tick();
+  assert.ok(first.closed);
+  assert.equal(f.fetchImpl.calls.at(-1).url, `${ROOT}.json`);
+  assert.equal(f.latest().projects[0].name, "From refresh");
+  assert.equal(f.timers[0].ms, 5000);
+
+  await f.runTimers();
+  assert.equal(FakeEventSource.instances.length, 2, "a new connection was opened");
+  f.es().send("put", { path: "/", data: HOUSEHOLD });
+  assert.equal(f.statuses.at(-1), "live");
+});
+
+test("data still loads when live updates are blocked entirely", async () => {
+  FakeEventSource.instances = [];
+  const fetchImpl = fakeFetch(() => ({ status: 200, body: HOUSEHOLD }));
+  const store = S.createFirebaseStore({
+    baseUrl: BASE,
+    key: KEY,
+    fetchImpl,
+    EventSourceImpl: function () {
+      throw new Error("blocked");
+    },
+    setTimer: () => 0,
+    clearTimer: () => {},
+  });
   let seen;
   store.subscribe((s) => (seen = s));
   await tick();
-
-  await store.put("tasks", { id: "t1", name: "Filter", frequency: 3, frequencyUnit: "months", history: [] });
-  const [op, kind, id, body] = db.calls[0];
-  assert.deepEqual([op, kind, id], ["set", "tasks", "t1"]);
-  assert.equal("id" in body, false);
-  assert.equal(body.name, "Filter");
-  assert.equal(seen.tasks[0].id, "t1");
-
-  await store.remove("tasks", "t1");
-  assert.deepEqual(db.calls[1], ["delete", "tasks", "t1"]);
-  assert.equal(seen.tasks.length, 0);
+  assert.equal(seen.tasks[0].name, "Replace HVAC filter");
 });
 
-test("shared store retries a write once after a transient failure", async () => {
-  const db = fakeDb();
-  const store = S.createSharedStore({ db });
-  store.subscribe(() => {});
+test("losing read access is reported as denied", async () => {
+  const f = firebaseStore(fakeFetch(() => ({ status: 401 })));
+  f.es().send("put", { path: "/", data: HOUSEHOLD });
+  f.es().send("cancel", "Permission denied");
   await tick();
-  db.fail("set", "unavailable");
-  await store.put("vendors", { id: "v1", name: "Ace" });
-  assert.equal(db.calls.length, 2);
-  assert.equal(db.data.vendors.get("v1").name, "Ace");
-
-  db.fail("set", "invalid_argument");
-  await assert.rejects(store.put("vendors", { id: "v2", name: "Bob" }), (e) => e.code === "invalid_argument");
+  assert.equal(f.statuses.at(-1), "denied");
 });
 
-test("shared store replaceAll removes what the backup doesn't have", async () => {
-  const db = fakeDb();
-  db.data.tasks.set("old", { name: "Old task" });
-  db.data.tasks.set("keep", { name: "Keep me" });
-  const store = S.createSharedStore({ db });
-  let seen;
-  store.subscribe((s) => (seen = s));
-  await tick();
-  await store.replaceAll({ tasks: [{ id: "keep", name: "Kept and renamed" }, { id: "new", name: "New" }] });
-  assert.deepEqual(seen.tasks.map((t) => [t.id, t.name]), [["keep", "Kept and renamed"], ["new", "New"]]);
+test("reconnect() only reconnects when not live", () => {
+  const f = firebaseStore();
+  f.es().send("put", { path: "/", data: HOUSEHOLD });
+  f.store.reconnect();
+  assert.equal(FakeEventSource.instances.length, 1);
+  f.es().fail(false);
+  f.store.reconnect();
+  assert.equal(FakeEventSource.instances.length, 2);
 });
 
-test("shared store resubscribes when the connection dies, and reports revoked access", async () => {
-  const db = fakeDb();
-  const store = S.createSharedStore({ db });
-  const errors = [];
-  store.subscribe(() => {}, (e) => errors.push(e.code));
-  await tick();
-  db.subs.tasks[0].error({ code: "unavailable" });
-  await new Promise((resolve) => setTimeout(resolve, 1100));
-  assert.equal(db.subs.tasks.length, 2, "a fresh listener was opened");
-  assert.deepEqual(errors, []);
-  db.subs.vendors[0].error({ code: "revoked" });
-  assert.deepEqual(errors, ["revoked"]);
-});
+// ---------- creating a household ----------
 
-test("shared store passes identity and downloads through", async () => {
-  const user = {
-    can: async (name) => (name === "data.write" ? true : null),
-    id: async () => "u_me",
-    profiles: async (ids) => Object.fromEntries(ids.map((id) => [id, { id, name: "Sam", isMe: id === "u_me" }])),
-  };
-  const saved = [];
-  const downloads = { save: async (req) => (saved.push(req), { status: "saved" }) };
-  const store = S.createSharedStore({ db: fakeDb(), user, downloads });
-  assert.equal(await store.canWrite(), true);
-  assert.equal(await store.me(), "u_me");
-  assert.equal((await store.people(["u_me"])).u_me.isMe, true);
-  assert.deepEqual(await store.people([]), {});
-  await store.saveFile("backup.json", "{}");
-  assert.deepEqual(saved, [{ filename: "backup.json", data: "{}" }]);
+test("createHousehold writes the current data under a new key", async () => {
+  const fetchImpl = fakeFetch(() => ({ status: 204 }));
+  const key = await S.createHousehold({
+    baseUrl: BASE,
+    fetchImpl,
+    data: { tasks: [{ id: "t1", name: "Filter" }], projects: [], vendors: [{ id: "v1", name: "Ace" }] },
+  });
+  assert.ok(S.isHouseholdKey(key));
+  const call = fetchImpl.calls[0];
+  assert.equal(call.method, "PUT");
+  assert.equal(call.url, `https://example-default-rtdb.firebaseio.com/households/${key}.json?print=silent`);
+  assert.ok(call.body.meta.createdAt);
+  assert.equal(call.body.tasks.t1.name, "Filter");
+  assert.equal(call.body.vendors.v1.name, "Ace");
 
-  assert.equal(await store.canSaveFile(), true);
-
-  // Identity and downloads can arrive later than the data, or not at all.
-  const bare = S.createSharedStore({ db: fakeDb(), user: Promise.resolve(null), downloads: Promise.resolve(null) });
-  assert.equal(await bare.canWrite(), null);
-  assert.equal(await bare.me(), null);
-  assert.deepEqual(await bare.people(["u_x"]), {});
-  assert.equal(await bare.canSaveFile(), false);
-  await assert.rejects(bare.saveFile("b.json", "{}"), (e) => e.code === "unavailable");
-});
-
-test("shared store ignores an empty cached list until the server confirms it", async () => {
-  const db = fakeDb({ cacheFirst: true });
-  db.data.tasks.set("t1", { name: "Filter" });
-  const store = S.createSharedStore({ db });
-  const updates = [];
-  store.subscribe((s) => updates.push(s.tasks.length));
-  await tick();
-  assert.deepEqual(updates, [], "an empty cached snapshot isn't shown");
-  await tick();
-  assert.deepEqual(updates, [1], "the confirmed snapshot is");
-});
-
-test("shared store accepts an empty cached list after a grace period", async () => {
-  const db = fakeDb({ cacheOnly: true });
-  const store = S.createSharedStore({ db, cacheGraceMs: 20 });
-  const updates = [];
-  store.subscribe((s) => updates.push(s.tasks.length));
-  await tick();
-  assert.deepEqual(updates, []);
-  await new Promise((resolve) => setTimeout(resolve, 60));
-  assert.deepEqual(updates, [0]);
-});
-
-// ---------- open ----------
-
-test("open picks the backend for where the page is running", async () => {
-  const local = await S.open({ win: {}, storage: memoryStorage() });
-  assert.equal(local.mode, "local");
-
-  const signedOut = await S.open({ win: { claude: { use: async () => null } } });
-  assert.equal(signedOut.mode, "unavailable");
-
-  const db = fakeDb();
-  const shared = await S.open({ win: { claude: { use: async (name) => (name === "db" ? db : null) } } });
-  assert.equal(shared.mode, "shared");
-
-  // A chat artifact's window.claude has no use(): treat it as a normal page.
-  const chat = await S.open({ win: { claude: { complete() {} } }, storage: memoryStorage() });
-  assert.equal(chat.mode, "local");
+  const refused = fakeFetch(() => ({ status: 401 }));
+  await assert.rejects(S.createHousehold({ baseUrl: BASE, fetchImpl: refused, data: {} }), (e) => e.code === "denied");
 });

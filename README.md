@@ -12,51 +12,66 @@ A simple web app for keeping a house in shape:
 - **Vendors**: your preferred contractors with trade, contact info, website, rating and
   notes. Vendors can be linked to tasks and projects.
 
-## Two ways to run it
+## Sharing with your household
 
-The same code runs in two modes and picks one automatically.
+The tracker can be shared through a link: anyone who opens it, on a phone or computer,
+sees the same tracker and can update it. There's no sign-in, and changes show up live
+for everyone who has it open. The site is hosted on GitHub Pages and the data is kept
+in a free Firebase Realtime Database that you own.
 
-### Shared (Claude artifact)
+### One-time setup (about 10 minutes)
 
-Published as a [Claude artifact](https://claude.ai), the tracker keeps its data in the
-artifact's built-in database. Everyone the artifact is shared with sees the same data,
-and changes show up live for everyone who has it open. Service entries record who
-logged them.
+1. **Create the database**
+   1. Go to <https://console.firebase.google.com> and create a project (Google
+      Analytics isn't needed).
+   2. In the project, open **Build → Realtime Database** and click **Create Database**.
+      Pick a location near you and choose **Start in locked mode**.
+   3. Open the **Rules** tab, replace everything there with the contents of
+      [`database.rules.json`](database.rules.json), and click **Publish**.
+   4. On the **Data** tab, copy the database URL. It looks like
+      `https://your-project-default-rtdb.firebaseio.com`.
+2. **Connect the app to it**: paste the URL into [`js/config.js`](js/config.js) as
+   `firebaseUrl` and commit the change. On GitHub you can do this in the browser: open
+   the file, click the pencil icon, edit, then **Commit changes**.
+3. **Put the site online**: in this repository on GitHub, go to **Settings → Pages**.
+   Under **Build and deployment**, choose **Deploy from a branch**, select the
+   `claude/house-maintenance-tracker-rk7rmp` branch and the `/ (root)` folder, and
+   **Save**. After a minute or two, the address appears at the top of that page
+   (for this repository it should be <https://wild97gt-maker.github.io/5301Wenesly/>).
+4. Open the site, click **Share**, then **Create share link**, and send the link to
+   your partner. The new shared tracker starts with whatever was in your browser.
 
-To build the single-file page that gets published:
+Each device remembers the tracker once the link has been opened, so the plain site
+address works afterwards too. Adding the page to your phone's home screen makes it
+feel like an app.
 
-```sh
-npm run build    # writes dist/house-maintenance.html
-```
+### Who can see and change it
 
-It is published with the `db`, `user` (profile scope) and `downloads` capabilities.
+- Anyone with the share link can view and edit the tracker, with no sign-in.
+- The link ends in a random 22-character code (`#k=…`). Without it the tracker can't be
+  found or opened, so treat the link like a password. The code comes after the `#`,
+  so it's never sent to GitHub.
+- The database URL in `js/config.js` is public, but on its own it gives no access to
+  your tracker.
+- Firebase may warn you that your rules allow public access. That's expected here:
+  the share link is the key.
+- To remove the tracker from one device, open **Share link** and choose
+  **Stop using this tracker on this device**. The shared tracker itself stays online.
 
-To share it with someone so they can also make changes:
+### Without sharing
 
-1. Open the artifact on claude.ai and choose **Share**.
-2. Invite them by email and give them edit access (**Editor**).
-3. Leave the public link off. While a public link is on, people outside your
-   organization can view but not edit.
-
-They need to be signed in to Claude to open it. Anyone with view-only access sees
-the tracker with editing turned off and a note explaining why.
-
-### Local (this browser only)
-
-Open `index.html` directly, or serve the folder (it also works as-is on GitHub Pages):
+If `firebaseUrl` in `js/config.js` is empty, there's no Share button and each browser
+keeps its own data in `localStorage`. Open `index.html` directly, or serve the folder:
 
 ```sh
 npm start        # python3 -m http.server 8000, then visit http://localhost:8000
 ```
 
-In this mode data is stored in the browser's `localStorage` and nothing is sent
-anywhere. It doesn't sync between browsers or devices.
-
 ### Backups and moving data
 
 **Export backup** in the footer saves everything as a JSON file, and **Import backup**
-replaces the tracker's contents with a saved file. To move data from a local copy into
-the shared one, export it from the local copy and import it into the shared one.
+replaces the tracker's contents with a saved file. To move data from another copy of
+the tracker, export it there and import it into the shared tracker.
 
 ## Tests
 
@@ -65,16 +80,18 @@ npm test
 ```
 
 Covers the scheduling logic in `js/logic.js` (next-due calculation, end-of-month
-handling, status classification, sorting) and both storage backends in `js/store.js`
-(the shared backend is tested against an in-memory stand-in for the artifact database).
+handling, status classification, sorting) and both storage backends in `js/store.js`.
+The Firebase backend is tested against stand-ins for `fetch` and `EventSource` that
+follow the Realtime Database REST streaming protocol.
 
 ## Files
 
 | File | Purpose |
 | --- | --- |
-| `index.html` | Page layout and the add/edit dialogs |
-| `styles.css` | Styling (light/dark themes, mobile layout) |
+| `index.html` | Page layout and dialogs |
+| `styles.css` | Styling (light/dark, mobile layout) |
+| `js/config.js` | Sharing settings (your Firebase database URL) |
 | `js/logic.js` | Pure date & scheduling helpers |
-| `js/store.js` | Storage: shared artifact database or this browser's localStorage |
-| `js/app.js` | UI, rendering, import/export |
-| `scripts/build-artifact.js` | Bundles everything into one page for publishing |
+| `js/store.js` | Storage: this browser's localStorage, or a shared Firebase household |
+| `js/app.js` | UI, rendering, sharing, import/export |
+| `database.rules.json` | Firebase rules: a household is readable and writable only with its key |

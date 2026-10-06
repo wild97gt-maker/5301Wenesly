@@ -3,6 +3,12 @@
 
   const L = window.HomeLogic;
   const S = window.HomeStore;
+  const CONFIG = window.TRACKER_CONFIG || {};
+  const SHARING = Boolean(CONFIG.firebaseUrl);
+
+  // Per-device settings (never shared).
+  const KEY_SETTING = "house-maintenance-tracker:household";
+  const NAME_SETTING = "house-maintenance-tracker:name";
 
   // Common tasks offered on an empty tracker. They have no "last serviced"
   // date yet, so they show up as "Not yet serviced".
@@ -30,7 +36,10 @@
   let store = null;
   let ready = false;
   let readOnly = false;
-  let myId = null;
+  let missing = false;
+  let connection = "live";
+  let badLink = false;
+  let generation = 0;
 
   // ---------- Helpers ----------
 
@@ -50,6 +59,10 @@
   function fmtMoney(n) {
     if (n === "" || n === null || n === undefined || isNaN(Number(n))) return "";
     return Number(n).toLocaleString(undefined, { style: "currency", currency: "USD" });
+  }
+
+  function plural(n, word) {
+    return `${n} ${word}${n === 1 ? "" : "s"}`;
   }
 
   function vendorById(id) {
@@ -78,6 +91,31 @@
     }
   }
 
+  function getSetting(name) {
+    try {
+      return localStorage.getItem(name);
+    } catch (e) {
+      return null;
+    }
+  }
+
+  function setSetting(name, value) {
+    try {
+      if (value === null) localStorage.removeItem(name);
+      else localStorage.setItem(name, value);
+    } catch (e) {
+      /* settings are a convenience */
+    }
+  }
+
+  function localStorageOrNull() {
+    try {
+      return window.localStorage;
+    } catch (e) {
+      return null;
+    }
+  }
+
   const STATUS_LABEL = {
     overdue: "Overdue",
     "due-soon": "Due soon",
@@ -97,14 +135,19 @@
     toastTimer = setTimeout(() => (el.hidden = true), kind === "error" ? 8000 : 3000);
   }
 
-  function showBanner(message) {
+  // One status line under the header; the most important problem wins.
+  function updateBanner() {
+    let message = "";
+    if (badLink) message = "This share link looks incomplete. Ask for the whole link, then open it again.";
+    else if (connection === "denied") message = "This tracker can't be opened. The share link may be incomplete, or the database rules have changed.";
+    else if (missing) message = "This shared tracker wasn't found. Check that you opened the whole share link.";
+    else if (connection === "offline") message = "Can't reach the shared tracker right now. Showing the last version loaded; reconnecting…";
+    else if (readOnly) message = "Changes can't be saved to this tracker right now. The database is refusing them.";
     const el = $("#banner");
     el.textContent = message;
     el.hidden = !message;
   }
 
-  // alert() and confirm() don't work inside Claude's artifact viewer, so
-  // confirmations use an in-page dialog.
   const confirmDialog = $("#confirm-dialog");
   function askConfirm({ title, message, confirmLabel }) {
     confirmDialog.querySelector("[data-confirm-title]").textContent = title;
@@ -125,12 +168,10 @@
   function setReadOnly(value) {
     readOnly = value;
     document.body.classList.toggle("read-only", value);
-    if (value) {
-      showBanner("You can view this tracker but not change it. Ask the person who shared it to give you edit access.");
-    }
+    updateBanner();
   }
 
-  // Runs a save and reports failures. Writes show up on screen right away;
+  // Runs a save and reports failures. Changes show on screen right away;
   // this only has to deal with the ones that didn't stick.
   async function commit(promise) {
     try {
@@ -138,19 +179,8 @@
       return true;
     } catch (err) {
       console.error(err);
-      const code = err && err.code;
-      if (code === "invalid_argument") {
-        setReadOnly(true);
-        toast("That change wasn't saved. You don't have edit access to this tracker.", "error");
-      } else if (code === "quota_exceeded") {
-        toast("The tracker is full. Delete some old items, then try again.", "error");
-      } else if (code === "resource_exhausted") {
-        toast("Too many changes at once. Wait a moment and try again.", "error");
-      } else if (code === "revoked") {
-        toast("Your access to this tracker changed. Reload the page.", "error");
-      } else {
-        toast((err && err.message) || "That change wasn't saved. Try again.", "error");
-      }
+      if (err && err.code === "denied") setReadOnly(true);
+      toast((err && err.message) || "That change wasn't saved. Try again.", "error");
       return false;
     }
   }
@@ -361,7 +391,7 @@
       if (!item) return dialog.close();
       const ok = await askConfirm({
         title: `Delete ${noun}?`,
-        message: `"${item.name}" will be removed${store.mode === "shared" ? " for everyone who uses this tracker" : ""}. This can't be undone.`,
+        message: `"${item.name}" will be removed${store.mode === "firebase" ? " for everyone who uses this tracker" : ""}. This can't be undone.`,
         confirmLabel: "Delete",
       });
       if (!ok) return;
@@ -408,31 +438,19 @@
   const serviceForm = $("#service-form");
   let servicingId = null;
 
-  async function renderHistory(task) {
+  function renderHistory(task) {
     const list = serviceDialog.querySelector("[data-history]");
     const history = [...task.history].sort((a, b) => b.date.localeCompare(a.date));
-    if (!history.length) {
-      list.innerHTML = '<li class="sub">No service logged yet.</li>';
-      return;
-    }
-    const ids = [...new Set(history.map((h) => h.by).filter(Boolean))];
-    let people = {};
-    try {
-      people = await store.people(ids);
-    } catch (e) {
-      /* names are a nicety; show the history without them */
-    }
-    if (servicingId !== task.id) return;
-    list.innerHTML = history.map((h) => {
-      const p = h.by && people[h.by];
-      const who = p ? (p.isMe ? "you" : p.name || "someone") : "";
-      const details = [vendorName(h.vendorId), h.notes].filter(Boolean).map(esc).join(" — ");
-      return `<li>
-        <span class="when">${fmtDate(h.date)}</span>
-        <span class="what">${details || "&nbsp;"}${who ? `<span class="by">Logged by ${esc(who)}</span>` : ""}</span>
-        <span class="cost">${h.cost !== "" ? fmtMoney(h.cost) : ""}</span>
-      </li>`;
-    }).join("");
+    list.innerHTML = history.length
+      ? history.map((h) => {
+          const details = [vendorName(h.vendorId), h.notes].filter(Boolean).map(esc).join(" — ");
+          return `<li>
+            <span class="when">${fmtDate(h.date)}</span>
+            <span class="what">${details || "&nbsp;"}${h.by ? `<span class="by">Logged by ${esc(h.by)}</span>` : ""}</span>
+            <span class="cost">${h.cost !== "" ? fmtMoney(h.cost) : ""}</span>
+          </li>`;
+        }).join("")
+      : '<li class="sub">No service logged yet.</li>';
   }
 
   function openService(task, { historyOnly = false } = {}) {
@@ -441,9 +459,9 @@
     fillVendorSelects(serviceForm);
     serviceForm.elements.date.value = L.todayString();
     serviceForm.elements.vendorId.value = task.vendorId || "";
+    serviceForm.elements.by.value = getSetting(NAME_SETTING) || "";
     serviceDialog.querySelector("[data-task-name]").textContent = task.name;
     serviceDialog.classList.toggle("history-only", historyOnly || readOnly);
-    serviceDialog.querySelector("[data-history]").innerHTML = "";
     renderHistory(task);
     serviceDialog.showModal();
   }
@@ -453,12 +471,14 @@
     const task = state.tasks.find((t) => t.id === servicingId);
     serviceDialog.close();
     if (!task) return;
+    const by = serviceForm.elements.by.value.trim();
+    if (store.mode === "firebase") setSetting(NAME_SETTING, by || null);
     const entry = {
       date: serviceForm.elements.date.value,
       cost: serviceForm.elements.cost.value,
       vendorId: serviceForm.elements.vendorId.value,
       notes: serviceForm.elements.notes.value.trim(),
-      by: myId || "",
+      by: store.mode === "firebase" ? by : "",
     };
     // Last serviced is the most recent logged date, so back-dating an old
     // entry doesn't move the schedule backwards.
@@ -468,6 +488,89 @@
     });
   });
   serviceDialog.querySelector("[data-cancel]").addEventListener("click", () => serviceDialog.close());
+
+  // ---------- Sharing ----------
+
+  function shareLink(key) {
+    return `${location.origin}${location.pathname}#k=${key}`;
+  }
+
+  function keyFromHash() {
+    const m = location.hash.match(/[#&]k=([A-Za-z0-9_-]{20,64})/);
+    return m ? m[1] : null;
+  }
+
+  const shareDialog = $("#share-dialog");
+
+  function renderShareDialog(error) {
+    const shared = store && store.mode === "firebase";
+    shareDialog.classList.toggle("is-shared", shared);
+    if (shared) {
+      $("#share-link").value = shareLink(store.key);
+    } else {
+      const counts = [plural(state.tasks.length, "task"), plural(state.projects.length, "project"), plural(state.vendors.length, "vendor")];
+      $("#share-start-note").textContent = `It starts with what's saved in this browser now: ${counts.join(", ")}.`;
+    }
+    const err = $("#share-error");
+    err.textContent = error || "";
+    err.hidden = !error;
+  }
+
+  function openShare() {
+    renderShareDialog();
+    shareDialog.showModal();
+  }
+
+  async function startSharing(btn) {
+    btn.disabled = true;
+    btn.textContent = "Creating link…";
+    try {
+      const key = await S.createHousehold({ baseUrl: CONFIG.firebaseUrl, data: state });
+      setSetting(KEY_SETTING, key);
+      history.replaceState(null, "", `#k=${key}`);
+      useStore(S.createFirebaseStore({ baseUrl: CONFIG.firebaseUrl, key }));
+      renderShareDialog();
+      toast("Shared tracker created");
+    } catch (err) {
+      console.error(err);
+      renderShareDialog(`The shared tracker couldn't be created. ${(err && err.message) || ""} Check your internet connection and the database setup in js/config.js.`);
+    } finally {
+      btn.disabled = false;
+      btn.textContent = "Create share link";
+    }
+  }
+
+  async function stopSharingHere() {
+    const ok = await askConfirm({
+      title: "Stop using this tracker here?",
+      message: "This device will go back to the data saved in this browser. The shared tracker stays online for everyone else, and opening the share link again brings it back.",
+      confirmLabel: "Stop using it here",
+    });
+    if (!ok) return;
+    setSetting(KEY_SETTING, null);
+    history.replaceState(null, "", location.pathname);
+    location.reload();
+  }
+
+  $("#share-button").addEventListener("click", openShare);
+  $("#share-create").addEventListener("click", (e) => startSharing(e.currentTarget));
+  $("#share-copy").addEventListener("click", (e) => copyText(e.currentTarget, $("#share-link").value, $("#share-link")));
+  $("#share-leave").addEventListener("click", () => {
+    shareDialog.close();
+    stopSharingHere();
+  });
+  shareDialog.querySelector("[data-cancel]").addEventListener("click", () => shareDialog.close());
+
+  // Opening a different share link in an open tab switches to that tracker.
+  window.addEventListener("hashchange", () => {
+    const key = keyFromHash();
+    if (SHARING && key && (!store || store.key !== key)) location.reload();
+  });
+
+  // Phones pause background tabs; catch up as soon as the page is back.
+  document.addEventListener("visibilitychange", () => {
+    if (!document.hidden && store) store.reconnect();
+  });
 
   // ---------- Events ----------
 
@@ -497,25 +600,28 @@
     renderTasks();
   });
 
-  function copyText(btn) {
-    const text = btn.dataset.copy;
+  function copyText(btn, text, selectable) {
     const fallback = () => {
       // Select the text so it can be copied by hand.
-      const target = btn.parentElement.querySelector("a");
-      const range = document.createRange();
-      range.selectNodeContents(target);
-      const sel = window.getSelection();
-      sel.removeAllRanges();
-      sel.addRange(range);
+      if (selectable.select) {
+        selectable.focus();
+        selectable.select();
+      } else {
+        const range = document.createRange();
+        range.selectNodeContents(selectable);
+        const sel = window.getSelection();
+        sel.removeAllRanges();
+        sel.addRange(range);
+      }
       toast("Selected. Copy it with your device's copy command.");
     };
     if (!navigator.clipboard || !navigator.clipboard.writeText) return fallback();
-    navigator.clipboard.writeText(text).then(() => toast(`Copied ${text}`), fallback);
+    navigator.clipboard.writeText(text).then(() => toast("Copied"), fallback);
   }
 
   document.addEventListener("click", async (e) => {
     const copyBtn = e.target.closest("[data-copy]");
-    if (copyBtn) return copyText(copyBtn);
+    if (copyBtn) return copyText(copyBtn, copyBtn.dataset.copy, copyBtn.parentElement.querySelector("a"));
     const btn = e.target.closest("[data-action]");
     if (!btn) return;
     const id = btn.dataset.id;
@@ -535,14 +641,15 @@
     }
   });
 
-  $("#export-data").addEventListener("click", async () => {
-    if (!store || store.mode === "unavailable") return;
-    const json = JSON.stringify(state, null, 2);
-    try {
-      await store.saveFile(`house-maintenance-${L.todayString()}.json`, json);
-    } catch (err) {
-      if (err && err.code !== "declined") toast("The backup couldn't be saved. Try again.", "error");
-    }
+  $("#export-data").addEventListener("click", () => {
+    const blob = new Blob([JSON.stringify(state, null, 2)], { type: "application/json" });
+    const a = document.createElement("a");
+    a.href = URL.createObjectURL(blob);
+    a.download = `house-maintenance-${L.todayString()}.json`;
+    document.body.appendChild(a);
+    a.click();
+    a.remove();
+    setTimeout(() => URL.revokeObjectURL(a.href), 1000);
   });
 
   $("#import-data").addEventListener("change", async (e) => {
@@ -559,7 +666,7 @@
     }
     const ok = await askConfirm({
       title: "Replace all data?",
-      message: `Everything in this tracker will be replaced with the ${data.tasks.length} tasks and other items in "${file.name}"${store.mode === "shared" ? ", for everyone who uses it" : ""}.`,
+      message: `Everything in this tracker will be replaced with the contents of "${file.name}"${store.mode === "firebase" ? ", for everyone who uses it" : ""}.`,
       confirmLabel: "Replace",
     });
     if (!ok) return;
@@ -568,50 +675,58 @@
 
   // ---------- Start ----------
 
-  async function start() {
-    render();
-    store = await S.open({ win: window, storage: safeLocalStorage(), starter: starterTasks });
-
-    if (store.mode === "unavailable") {
-      // Inside Claude, but the shared data isn't reachable (usually signed out).
-      document.body.classList.add("no-data");
-      showBanner("The shared tracker couldn't load here. Open it from your Claude link while signed in to Claude.");
-      return;
-    }
-
-    $("#storage-note").textContent = store.mode === "shared"
-      ? "Shared: changes sync for everyone who has access."
+  // Switch to a store, ignoring updates from any store used before it.
+  function useStore(next) {
+    const gen = ++generation;
+    store = next;
+    const shared = store.mode === "firebase";
+    document.body.classList.toggle("shared", shared);
+    $("#mode-chip").hidden = !shared;
+    $("#storage-note").textContent = shared
+      ? "Shared: anyone with the share link can view and edit."
       : "Saved in this browser only.";
-    $("#mode-chip").hidden = store.mode !== "shared";
-    $("#export-data").hidden = true;
-    store.canSaveFile().then((ok) => ($("#export-data").hidden = !ok));
-
+    $("#share-button").textContent = shared ? "Share link" : "Share";
     store.subscribe(
-      (next) => {
-        state = next;
+      (nextState, info) => {
+        if (gen !== generation) return;
+        state = nextState;
         ready = true;
+        missing = !info.exists;
         document.body.classList.add("ready");
+        // Don't let edits quietly create a tracker at a mistyped link.
+        document.body.classList.toggle("missing", missing);
+        updateBanner();
         render();
       },
-      (err) => {
-        console.error(err);
-        showBanner(err && err.code === "revoked"
-          ? "Your access to this tracker changed. Reload the page to continue."
-          : "Live updates stopped. Reload the page to see the latest changes.");
+      (status) => {
+        if (gen !== generation) return;
+        connection = status;
+        $("#mode-chip").classList.toggle("offline", status !== "live");
+        $("#mode-chip-label").textContent = status === "live" ? "Shared" : "Offline";
+        updateBanner();
       }
     );
-
-    const [canWrite, me] = await Promise.all([store.canWrite(), store.me()]);
-    myId = me;
-    if (canWrite === false) setReadOnly(true);
   }
 
-  function safeLocalStorage() {
-    try {
-      return window.localStorage;
-    } catch (e) {
-      return null;
+  function start() {
+    $("#share-button").hidden = !SHARING;
+    let key = null;
+    if (SHARING) {
+      // A link with "#k=" but a cut-off key: say so rather than quietly
+      // opening this browser's own tracker.
+      badLink = /[#&]k=/.test(location.hash) && !keyFromHash();
+      key = keyFromHash() || getSetting(KEY_SETTING);
+      if (!S.isHouseholdKey(key)) key = null;
     }
+    if (key) {
+      setSetting(KEY_SETTING, key);
+      // Keep the share link in the address bar so it can be bookmarked.
+      if (keyFromHash() !== key) history.replaceState(null, "", `#k=${key}`);
+      useStore(S.createFirebaseStore({ baseUrl: CONFIG.firebaseUrl, key }));
+    } else {
+      useStore(S.createLocalStore({ storage: localStorageOrNull(), starter: starterTasks, win: window }));
+    }
+    updateBanner();
   }
 
   start();

@@ -1,23 +1,19 @@
 // Where the tracker keeps its data. Two backends share one interface:
 //
-//   local  - this browser's localStorage (opening index.html directly, or any
-//            normal web host). Only the person on this browser sees it.
-//   shared - the Claude artifact database, used when the page is published as
-//            a Claude artifact. Everyone the artifact is shared with sees the
-//            same data, and changes arrive live.
+//   local    - this browser's localStorage. Only this browser sees it.
+//   firebase - a "household" in a Firebase Realtime Database. Everyone with
+//              the household's share link can open and edit it on any device,
+//              with no sign-in, and changes arrive live.
 //
 // Interface:
-//   store.mode                       "local" | "shared" | "unavailable"
-//   store.subscribe(onChange, onError) calls onChange(state) once data is
-//                                     loaded and again after every change
-//   store.put(kind, item)            create or replace one record
+//   store.mode                         "local" | "firebase"
+//   store.subscribe(onChange, onStatus) onChange(state, { exists }) once data
+//                                       has loaded and after every change;
+//                                       onStatus("live" | "offline" | "denied")
+//   store.put(kind, item)              create or replace one record
 //   store.remove(kind, id)
-//   store.replaceAll(state)          used by "Import backup"
-//   store.canWrite()                 Promise<true | false | null> (null = unknown)
-//   store.me()                       Promise<user id | null>
-//   store.people(ids)                Promise<{ [id]: { name, isMe } }>
-//   store.canSaveFile()              Promise<boolean>: can "Export backup" work here
-//   store.saveFile(filename, text)   offer a file to download
+//   store.replaceAll(state)            used by "Import backup"
+//   store.reconnect()                  retry right away (e.g. tab came back)
 //
 // Loaded as a classic script (window.HomeStore) and via require() in tests.
 (function (root, factory) {
@@ -30,7 +26,7 @@
   const UNITS = ["days", "weeks", "months", "years"];
 
   // Every field a record can have, with its default. Data can come from an
-  // imported file or from another person's browser, so it is cleaned on the
+  // imported file or from another person's device, so it is cleaned on the
   // way in rather than trusted.
   const FIELDS = {
     tasks: {
@@ -50,9 +46,20 @@
     return Date.now().toString(36) + Math.random().toString(36).slice(2, 8);
   }
 
-  // Ids double as database document names, which allow only these characters.
+  // Ids double as database keys, which allow only these characters.
   function isValidId(id) {
-    return typeof id === "string" && /^[A-Za-z0-9_\-.~:@+]{1,200}$/.test(id) && id !== "." && id !== "..";
+    return typeof id === "string" && /^[A-Za-z0-9_-]{1,100}$/.test(id);
+  }
+
+  // A household key is the secret part of a share link.
+  function isHouseholdKey(key) {
+    return typeof key === "string" && /^[A-Za-z0-9_-]{20,64}$/.test(key);
+  }
+
+  // 16 random bytes (128 bits), written in URL-safe base64: 22 characters.
+  function newHouseholdKey(getRandomValues = (a) => crypto.getRandomValues(a)) {
+    const bytes = getRandomValues(new Uint8Array(16));
+    return btoa(String.fromCharCode(...bytes)).replace(/\+/g, "-").replace(/\//g, "_").replace(/=+$/, "");
   }
 
   function emptyState() {
@@ -73,7 +80,9 @@
     for (const [key, def] of Object.entries(FIELDS[kind])) {
       const v = src[key];
       if (Array.isArray(def)) {
-        out[key] = Array.isArray(v) ? v.filter((h) => h && typeof h === "object").map(cleanHistory) : [];
+        // Firebase can hand back a list as an object keyed "0", "1", ...
+        const list = Array.isArray(v) ? v : v && typeof v === "object" ? Object.values(v) : [];
+        out[key] = list.filter((h) => h && typeof h === "object").map(cleanHistory);
       } else if (typeof def === "number") {
         const n = Number(v);
         out[key] = Number.isFinite(n) && n > 0 ? n : def;
@@ -95,7 +104,7 @@
       s[kind] = data[kind]
         .filter((item) => item && typeof item === "object")
         .map((item) => {
-          let id = isValidId(item.id) && !seen.has(item.id) ? item.id : uid();
+          const id = isValidId(item.id) && !seen.has(item.id) ? item.id : uid();
           seen.add(id);
           return cleanItem(kind, item, id);
         });
@@ -103,14 +112,42 @@
     return s;
   }
 
-  // Database documents hold everything except the id, which is the document name.
-  function toDoc(item) {
-    const { id, ...body } = item;
-    return JSON.parse(JSON.stringify(body));
+  // Firebase rejects keys containing . $ # [ ] / or control characters.
+  function firebaseSafe(value) {
+    if (Array.isArray(value)) return value.map(firebaseSafe);
+    if (!value || typeof value !== "object") return value;
+    const out = {};
+    for (const [k, v] of Object.entries(value)) {
+      if (k && !/[.$#[\]/\u0000-\u001f\u007f]/.test(k)) out[k] = firebaseSafe(v);
+    }
+    return out;
   }
 
-  function wait(ms) {
-    return new Promise((resolve) => setTimeout(resolve, ms));
+  // A stored record holds everything except its id, which is its key.
+  function toDoc(item) {
+    const { id, ...body } = item;
+    return firebaseSafe(JSON.parse(JSON.stringify(body)));
+  }
+
+  // { tasks: [...], ... } -> { tasks: { id: body }, ... }
+  function toMaps(state) {
+    const out = {};
+    for (const kind of KINDS) out[kind] = Object.fromEntries(state[kind].map((x) => [x.id, toDoc(x)]));
+    return out;
+  }
+
+  // { tasks: { id: body }, ... } -> { tasks: [...], ... }
+  function fromTree(tree) {
+    const s = emptyState();
+    if (!tree || typeof tree !== "object") return s;
+    for (const kind of KINDS) {
+      const coll = tree[kind];
+      if (!coll || typeof coll !== "object") continue;
+      s[kind] = Object.keys(coll)
+        .filter((id) => isValidId(id) && coll[id] && typeof coll[id] === "object")
+        .map((id) => cleanItem(kind, coll[id], id));
+    }
+    return s;
   }
 
   // ---------- Local (this browser only) ----------
@@ -144,7 +181,7 @@
     const listeners = new Set();
 
     function notify() {
-      listeners.forEach((fn) => fn(current));
+      listeners.forEach((fn) => fn(current, { exists: true }));
     }
 
     function commit(next) {
@@ -171,23 +208,12 @@
       });
     }
 
-    function saveFile(filename, text) {
-      const doc = win.document;
-      const a = doc.createElement("a");
-      a.href = win.URL.createObjectURL(new win.Blob([text], { type: "application/json" }));
-      a.download = filename;
-      doc.body.appendChild(a);
-      a.click();
-      a.remove();
-      setTimeout(() => win.URL.revokeObjectURL(a.href), 1000);
-      return Promise.resolve({ status: "saved" });
-    }
-
     return {
       mode: "local",
-      subscribe(onChange) {
+      subscribe(onChange, onStatus) {
         listeners.add(onChange);
-        onChange(current);
+        onChange(current, { exists: true });
+        if (onStatus) onStatus("live");
       },
       put(kind, item) {
         const clean = cleanItem(kind, item, item.id);
@@ -202,137 +228,242 @@
       replaceAll(next) {
         return commit(normalize(next));
       },
-      canWrite: () => Promise.resolve(true),
-      me: () => Promise.resolve(null),
-      people: () => Promise.resolve({}),
-      canSaveFile: () => Promise.resolve(Boolean(win && win.document)),
-      saveFile,
+      reconnect() {},
     };
   }
 
-  // ---------- Shared (Claude artifact database) ----------
+  // ---------- Firebase (shared household, no sign-in) ----------
+  //
+  // Uses the Realtime Database REST API: reads and writes are plain HTTPS
+  // requests, and live updates come from its server-sent event stream, so no
+  // Firebase SDK is needed. Data lives at /households/<key>:
+  //   { meta: {...}, tasks: { <id>: {...} }, projects: {...}, vendors: {...} }
 
-  // `user` and `downloads` may be promises: the page shouldn't wait for them
-  // before showing data.
-  function createSharedStore({ db, user, downloads, cacheGraceMs = 5000 }) {
-    const userReady = Promise.resolve(user).catch(() => null);
-    const downloadsReady = Promise.resolve(downloads).catch(() => null);
-    let current = emptyState();
-    const loaded = new Set();
-    const graceTimers = {};
-    const listeners = new Set();
-    const errorListeners = new Set();
+  function trimSlash(url) {
+    return String(url).replace(/\/+$/, "");
+  }
+
+  function householdUrl(baseUrl, key, path = "", query = "") {
+    return `${trimSlash(baseUrl)}/households/${key}${path ? "/" + path : ""}.json${query}`;
+  }
+
+  // Turns an HTTP failure into an error with a code the page can explain.
+  async function send(fetchImpl, url, method, body) {
+    let res;
+    try {
+      res = await fetchImpl(url, { method, body: body === undefined ? undefined : JSON.stringify(body) });
+    } catch (err) {
+      throw { code: "offline", message: "You seem to be offline, so that change wasn't saved. Check your connection and try again." };
+    }
+    if (res.status === 401 || res.status === 403) {
+      throw { code: "denied", message: "The database refused the change. Check that its rules match database.rules.json." };
+    }
+    if (!res.ok) throw { code: "unavailable", message: `The database couldn't save that change (error ${res.status}). Try again.` };
+    return res;
+  }
+
+  async function createHousehold({ baseUrl, data, fetchImpl = fetch, getRandomValues } = {}) {
+    const key = newHouseholdKey(getRandomValues);
+    const body = { meta: { createdAt: new Date().toISOString() }, ...toMaps(normalize(data)) };
+    await send(fetchImpl, householdUrl(baseUrl, key, "", "?print=silent"), "PUT", body);
+    return key;
+  }
+
+  function createFirebaseStore({
+    baseUrl,
+    key,
+    fetchImpl = (...args) => fetch(...args),
+    EventSourceImpl = typeof EventSource !== "undefined" ? EventSource : undefined,
+    retryMs = 5000,
+    setTimer = (fn, ms) => setTimeout(fn, ms),
+    clearTimer = (t) => clearTimeout(t),
+  }) {
+    if (!isHouseholdKey(key)) throw new TypeError("Not a household key");
+    let tree; // undefined until loaded; null when the household doesn't exist
     let started = false;
+    let status = null;
+    let source = null;
+    let retryTimer = null;
+    let failures = 0;
+    const listeners = new Set();
+    const statusListeners = new Set();
 
-    // Wait until all three lists have arrived so the page never shows a
-    // half-loaded tracker.
+    function setStatus(next) {
+      if (next === status) return;
+      status = next;
+      statusListeners.forEach((fn) => fn(next));
+    }
+
     function emit() {
-      if (loaded.size === KINDS.length) listeners.forEach((fn) => fn(current));
+      if (tree === undefined) return;
+      const state = fromTree(tree);
+      const info = { exists: tree !== null };
+      listeners.forEach((fn) => fn(state, info));
     }
 
-    function listen(kind, retries) {
-      db.collection(kind).onSnapshot(
-        (snap) => {
-          current = { ...current, [kind]: snap.docs.map((d) => cleanItem(kind, d.data(), d.id)) };
-          // An empty list straight from the local cache may just mean the
-          // server hasn't answered yet; showing it would flash "no tasks".
-          // Accept it only once confirmed, or after a grace period offline.
-          const fromCache = Boolean(snap.metadata && snap.metadata.fromCache);
-          if (!fromCache || snap.docs.length > 0) {
-            loaded.add(kind);
-          } else if (!loaded.has(kind) && !graceTimers[kind]) {
-            graceTimers[kind] = setTimeout(() => {
-              loaded.add(kind);
-              emit();
-            }, cacheGraceMs);
-          }
-          emit();
-        },
-        (err) => {
-          // "unavailable" here means the connection itself died; a fresh
-          // subscription is the only way back.
-          if (err && err.code === "unavailable" && retries < 5) {
-            setTimeout(() => listen(kind, retries + 1), 1000 * 2 ** retries);
-          } else {
-            errorListeners.forEach((fn) => fn(err));
-          }
-        }
-      );
+    function parts(path) {
+      return String(path).split("/").filter(Boolean);
     }
 
-    // Retry a write once after a short random pause on a transient failure.
-    async function attempt(fn) {
+    function getAt(path) {
+      let node = tree;
+      for (const p of parts(path)) {
+        if (!node || typeof node !== "object") return null;
+        node = node[p];
+      }
+      return node === undefined ? null : JSON.parse(JSON.stringify(node));
+    }
+
+    // Set the value at a slash path in the local copy; null deletes it.
+    function setAt(path, value) {
+      const keys = parts(path);
+      if (!keys.length) {
+        tree = value === undefined ? null : value;
+        return;
+      }
+      if (!tree || typeof tree !== "object") tree = {};
+      let node = tree;
+      for (const k of keys.slice(0, -1)) {
+        if (!node[k] || typeof node[k] !== "object") node[k] = {};
+        node = node[k];
+      }
+      const last = keys[keys.length - 1];
+      if (value === null || value === undefined) delete node[last];
+      else node[last] = value;
+    }
+
+    function onEvent(e, isPatch) {
+      let msg;
       try {
-        return await fn();
+        msg = JSON.parse(e.data);
       } catch (err) {
-        if (err && err.code === "unavailable") {
-          await wait(300 + Math.random() * 700);
-          return fn();
+        return;
+      }
+      if (!msg || typeof msg.path !== "string") return;
+      if (isPatch) {
+        if (msg.data && typeof msg.data === "object") {
+          for (const [k, v] of Object.entries(msg.data)) setAt(`${msg.path}/${k}`, v);
         }
+      } else {
+        setAt(msg.path, msg.data);
+      }
+      failures = 0;
+      setStatus("live");
+      emit();
+    }
+
+    // Fetch the whole household once. Used before the stream is up, after
+    // the stream drops, and to recover from a failed write.
+    async function refresh() {
+      try {
+        const res = await fetchImpl(householdUrl(baseUrl, key));
+        if (res.status === 401 || res.status === 403) {
+          setStatus("denied");
+          return;
+        }
+        if (!res.ok) return;
+        tree = await res.json();
+        emit();
+      } catch (err) {
+        /* offline: keep what we have */
+      }
+    }
+
+    function scheduleRetry() {
+      if (source) source.close();
+      source = null;
+      failures += 1;
+      if (status !== "denied") setStatus("offline");
+      refresh();
+      clearTimer(retryTimer);
+      retryTimer = setTimer(connect, Math.min(retryMs * 2 ** (failures - 1), 60000));
+    }
+
+    function connect() {
+      clearTimer(retryTimer);
+      if (source) source.close();
+      try {
+        source = new EventSourceImpl(householdUrl(baseUrl, key));
+      } catch (err) {
+        source = null;
+        scheduleRetry();
+        return;
+      }
+      const current = source;
+      current.addEventListener("put", (e) => current === source && onEvent(e, false));
+      current.addEventListener("patch", (e) => current === source && onEvent(e, true));
+      // The database's rules stopped allowing reads here.
+      current.addEventListener("cancel", () => {
+        if (current !== source) return;
+        setStatus("denied");
+        scheduleRetry();
+      });
+      current.onerror = () => {
+        if (current !== source) return;
+        // CLOSED (2) means the browser gave up; otherwise it is already
+        // reconnecting by itself.
+        if (current.readyState === 2) scheduleRetry();
+        else if (tree !== undefined) setStatus("offline");
+      };
+    }
+
+    // Show a change immediately; the live stream then confirms it. If the
+    // database refuses it, put back what was there before.
+    async function write(method, path, body) {
+      const before = getAt(path);
+      setAt(path, method === "DELETE" ? null : body);
+      emit();
+      const url = householdUrl(baseUrl, key, path, "?print=silent");
+      try {
+        try {
+          await send(fetchImpl, url, method, body);
+        } catch (err) {
+          if (err.code !== "unavailable") throw err;
+          await new Promise((resolve) => setTimer(resolve, 500 + Math.random() * 500));
+          await send(fetchImpl, url, method, body);
+        }
+      } catch (err) {
+        setAt(path, before);
+        emit();
+        refresh();
         throw err;
       }
     }
 
-    function put(kind, item) {
-      return attempt(() => db.collection(kind).doc(item.id).set(toDoc(cleanItem(kind, item, item.id))));
-    }
-
-    function remove(kind, id) {
-      return attempt(() => db.collection(kind).doc(id).delete());
-    }
-
     return {
-      mode: "shared",
-      subscribe(onChange, onError) {
+      mode: "firebase",
+      key,
+      subscribe(onChange, onStatus) {
         listeners.add(onChange);
-        if (onError) errorListeners.add(onError);
-        if (loaded.size === KINDS.length) onChange(current);
+        if (onStatus) statusListeners.add(onStatus);
+        if (tree !== undefined) onChange(fromTree(tree), { exists: tree !== null });
         if (!started) {
           started = true;
-          KINDS.forEach((kind) => listen(kind, 0));
+          connect();
         }
       },
-      put,
-      remove,
-      async replaceAll(next) {
-        const clean = normalize(next);
-        for (const kind of KINDS) {
-          const keep = new Set(clean[kind].map((x) => x.id));
-          for (const old of current[kind]) if (!keep.has(old.id)) await remove(kind, old.id);
-          for (const item of clean[kind]) await put(kind, item);
+      put(kind, item) {
+        return write("PUT", `${kind}/${item.id}`, toDoc(cleanItem(kind, item, item.id)));
+      },
+      remove(kind, id) {
+        return write("DELETE", `${kind}/${id}`);
+      },
+      replaceAll(next) {
+        const meta = (tree && tree.meta) || { createdAt: new Date().toISOString() };
+        return write("PUT", "", { meta, ...toMaps(normalize(next)) });
+      },
+      reconnect() {
+        if (status !== "live") {
+          failures = 0;
+          connect();
         }
       },
-      canWrite: async () => {
-        const u = await userReady;
-        return u ? u.can("data.write") : null;
-      },
-      me: async () => {
-        const u = await userReady;
-        return u ? u.id() : null;
-      },
-      people: async (ids) => {
-        const u = await userReady;
-        return u && ids.length ? u.profiles(ids) : {};
-      },
-      canSaveFile: async () => Boolean(await downloadsReady),
-      saveFile: async (filename, text) => {
-        const d = await downloadsReady;
-        if (!d) throw { code: "unavailable", message: "Saving files isn't available here." };
-        return d.save({ filename, data: text });
+      close() {
+        clearTimer(retryTimer);
+        if (source) source.close();
+        source = null;
       },
     };
-  }
-
-  // Inside Claude's artifact viewer `window.claude.use` exists and the shared
-  // database is used. Anywhere else the tracker falls back to localStorage.
-  async function open({ win, storage, starter } = {}) {
-    const claude = win && win.claude;
-    if (!claude || typeof claude.use !== "function") {
-      return createLocalStore({ storage, starter, win });
-    }
-    const db = await claude.use("db");
-    if (!db) return { mode: "unavailable" };
-    return createSharedStore({ db, user: claude.use("user"), downloads: claude.use("downloads") });
   }
 
   return {
@@ -340,12 +471,15 @@
     STORAGE_KEY,
     uid,
     isValidId,
+    isHouseholdKey,
+    newHouseholdKey,
     emptyState,
     normalize,
     cleanItem,
     toDoc,
+    firebaseSafe,
     createLocalStore,
-    createSharedStore,
-    open,
+    createHousehold,
+    createFirebaseStore,
   };
 });

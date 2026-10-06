@@ -1,0 +1,13 @@
+{
+  "rules": {
+    "households": {
+      "$household": {
+        ".read": "$household.length >= 20",
+        ".write": "$household.length >= 20",
+        "$section": {
+          ".validate": "$section === 'meta' || $section === 'tasks' || $section === 'projects' || $section === 'vendors'"
+        }
+      }
+    }
+  }
+}

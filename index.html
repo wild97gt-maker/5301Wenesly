@@ -10,7 +10,9 @@
   <header class="app-header">
     <div class="title-row">
       <h1>🏠 House Maintenance</h1>
-      <span class="chip" id="mode-chip" hidden><span class="dot" aria-hidden="true"></span>Shared</span>
+      <span class="chip" id="mode-chip" hidden><span class="dot" aria-hidden="true"></span><span id="mode-chip-label">Shared</span></span>
+      <span class="spacer"></span>
+      <button id="share-button" hidden>Share</button>
     </div>
     <nav class="tabs" role="tablist">
       <button class="tab active" data-view="maintenance" role="tab" aria-selected="true">Maintenance</button>
@@ -137,6 +139,7 @@
           <label>Done by<select id="service-vendor" name="vendorId" data-vendor-select></select></label>
         </div>
         <label>Notes<textarea id="service-notes" name="notes" rows="2"></textarea></label>
+        <label class="log-name">Logged by (optional)<input id="service-by" name="by" autocomplete="given-name" placeholder="Your name, remembered on this device" /></label>
         <h3>History</h3>
       </div>
       <ul class="history" data-history></ul>
@@ -222,7 +225,31 @@
     </form>
   </dialog>
 
-  <!-- Confirmation dialog (alert/confirm don't work inside Claude's viewer) -->
+  <!-- Share dialog -->
+  <dialog id="share-dialog">
+    <form id="share-form">
+      <h2 class="when-local">Share with your household</h2>
+      <h2 class="when-shared">Share this tracker</h2>
+      <div class="when-local share-body">
+        <p>Create a link that anyone you send it to can open on their phone or computer to see and update this tracker. No sign-in or account needed.</p>
+        <p class="sub" id="share-start-note"></p>
+        <button type="button" class="primary" id="share-create">Create share link</button>
+      </div>
+      <div class="when-shared share-body">
+        <label>Share link<input id="share-link" readonly /></label>
+        <div><button type="button" class="primary" id="share-copy">Copy link</button></div>
+        <p class="sub">Anyone with this link can view and edit this tracker, so only send it to people you trust. It works like a password: there's no way to find the tracker without it.</p>
+        <p class="sub"><button type="button" class="link" id="share-leave">Stop using this tracker on this device</button></p>
+      </div>
+      <p class="share-error" id="share-error" role="alert" hidden></p>
+      <div class="dialog-actions">
+        <span class="spacer"></span>
+        <button type="button" data-cancel>Close</button>
+      </div>
+    </form>
+  </dialog>
+
+  <!-- Confirmation dialog -->
   <dialog id="confirm-dialog" class="confirm">
     <form id="confirm-form">
       <h2 data-confirm-title></h2>
@@ -242,6 +269,7 @@
     <option>Pest control</option><option>Painter</option><option>Cleaner</option>
   </datalist>
 
+  <script src="js/config.js"></script>
   <script src="js/logic.js"></script>
   <script src="js/store.js"></script>
   <script src="js/app.js"></script>
