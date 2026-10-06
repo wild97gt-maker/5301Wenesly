@@ -1,0 +1,223 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>House Maintenance Tracker</title>
+  <link rel="stylesheet" href="styles.css" />
+</head>
+<body>
+  <header class="app-header">
+    <h1>🏠 House Maintenance</h1>
+    <nav class="tabs" role="tablist">
+      <button class="tab active" data-view="maintenance" role="tab">Maintenance</button>
+      <button class="tab" data-view="projects" role="tab">Projects</button>
+      <button class="tab" data-view="vendors" role="tab">Vendors</button>
+    </nav>
+  </header>
+
+  <main>
+    <!-- Maintenance -->
+    <section id="view-maintenance" class="view">
+      <div class="summary" id="summary"></div>
+      <div class="toolbar">
+        <input type="search" id="task-search" placeholder="Search tasks…" />
+        <select id="task-filter">
+          <option value="all">All statuses</option>
+          <option value="overdue">Overdue</option>
+          <option value="due-soon">Due soon</option>
+          <option value="never">Not yet serviced</option>
+          <option value="ok">Up to date</option>
+        </select>
+        <button class="primary" id="add-task">+ Add task</button>
+      </div>
+      <div class="table-wrap">
+        <table class="data">
+          <thead>
+            <tr>
+              <th>Task</th>
+              <th>Frequency</th>
+              <th>Last serviced</th>
+              <th>Next due</th>
+              <th>Status</th>
+              <th>Vendor</th>
+              <th></th>
+            </tr>
+          </thead>
+          <tbody id="task-rows"></tbody>
+        </table>
+      </div>
+      <p class="empty" id="task-empty" hidden>No maintenance tasks yet. Add one to get started.</p>
+    </section>
+
+    <!-- Projects -->
+    <section id="view-projects" class="view" hidden>
+      <div class="toolbar">
+        <input type="search" id="project-search" placeholder="Search projects…" />
+        <select id="project-filter">
+          <option value="all">All statuses</option>
+          <option value="Idea">Idea</option>
+          <option value="Planned">Planned</option>
+          <option value="In progress">In progress</option>
+          <option value="Done">Done</option>
+        </select>
+        <button class="primary" id="add-project">+ Add project</button>
+      </div>
+      <div class="cards" id="project-cards"></div>
+      <p class="empty" id="project-empty" hidden>No projects yet.</p>
+    </section>
+
+    <!-- Vendors -->
+    <section id="view-vendors" class="view" hidden>
+      <div class="toolbar">
+        <input type="search" id="vendor-search" placeholder="Search vendors…" />
+        <button class="primary" id="add-vendor">+ Add vendor</button>
+      </div>
+      <div class="cards" id="vendor-cards"></div>
+      <p class="empty" id="vendor-empty" hidden>No preferred vendors yet.</p>
+    </section>
+  </main>
+
+  <footer class="app-footer">
+    <span>Data is saved in this browser.</span>
+    <button class="link" id="export-data">Export backup</button>
+    <label class="link">Import backup<input type="file" id="import-data" accept="application/json" hidden /></label>
+  </footer>
+
+  <!-- Task dialog -->
+  <dialog id="task-dialog">
+    <form method="dialog" id="task-form">
+      <h2 data-title>Maintenance task</h2>
+      <label>Task name<input name="name" required placeholder="e.g. Replace HVAC filter" /></label>
+      <div class="row">
+        <label>Category<input name="category" list="category-list" placeholder="e.g. HVAC" /></label>
+        <label>Location<input name="location" placeholder="e.g. Basement" /></label>
+      </div>
+      <div class="row">
+        <label>Every<input name="frequency" type="number" min="1" step="1" required value="1" /></label>
+        <label>Unit
+          <select name="frequencyUnit">
+            <option value="days">Days</option>
+            <option value="weeks">Weeks</option>
+            <option value="months" selected>Months</option>
+            <option value="years">Years</option>
+          </select>
+        </label>
+      </div>
+      <label>Last serviced<input name="lastServiced" type="date" /></label>
+      <label>Preferred vendor<select name="vendorId" data-vendor-select></select></label>
+      <label>Notes<textarea name="notes" rows="3" placeholder="Filter size, model numbers, etc."></textarea></label>
+      <div class="dialog-actions">
+        <button type="button" class="danger" data-delete hidden>Delete</button>
+        <span class="spacer"></span>
+        <button type="button" data-cancel>Cancel</button>
+        <button type="submit" class="primary">Save</button>
+      </div>
+    </form>
+  </dialog>
+
+  <!-- Log service dialog -->
+  <dialog id="service-dialog">
+    <form method="dialog" id="service-form">
+      <h2>Log service: <span data-task-name></span></h2>
+      <label>Date serviced<input name="date" type="date" required /></label>
+      <div class="row">
+        <label>Cost<input name="cost" type="number" min="0" step="0.01" placeholder="0.00" /></label>
+        <label>Done by<select name="vendorId" data-vendor-select></select></label>
+      </div>
+      <label>Notes<textarea name="notes" rows="2"></textarea></label>
+      <h3>History</h3>
+      <ul class="history" data-history></ul>
+      <div class="dialog-actions">
+        <span class="spacer"></span>
+        <button type="button" data-cancel>Cancel</button>
+        <button type="submit" class="primary">Log service</button>
+      </div>
+    </form>
+  </dialog>
+
+  <!-- Project dialog -->
+  <dialog id="project-dialog">
+    <form method="dialog" id="project-form">
+      <h2>Project</h2>
+      <label>Project name<input name="name" required placeholder="e.g. Repaint deck" /></label>
+      <div class="row">
+        <label>Status
+          <select name="status">
+            <option>Idea</option>
+            <option selected>Planned</option>
+            <option>In progress</option>
+            <option>Done</option>
+          </select>
+        </label>
+        <label>Priority
+          <select name="priority">
+            <option>Low</option>
+            <option selected>Medium</option>
+            <option>High</option>
+          </select>
+        </label>
+      </div>
+      <div class="row">
+        <label>Target date<input name="targetDate" type="date" /></label>
+        <label>Budget<input name="budget" type="number" min="0" step="0.01" /></label>
+      </div>
+      <div class="row">
+        <label>Actual cost<input name="actualCost" type="number" min="0" step="0.01" /></label>
+        <label>Vendor<select name="vendorId" data-vendor-select></select></label>
+      </div>
+      <label>Notes<textarea name="notes" rows="3"></textarea></label>
+      <div class="dialog-actions">
+        <button type="button" class="danger" data-delete hidden>Delete</button>
+        <span class="spacer"></span>
+        <button type="button" data-cancel>Cancel</button>
+        <button type="submit" class="primary">Save</button>
+      </div>
+    </form>
+  </dialog>
+
+  <!-- Vendor dialog -->
+  <dialog id="vendor-dialog">
+    <form method="dialog" id="vendor-form">
+      <h2>Vendor</h2>
+      <label>Name / company<input name="name" required /></label>
+      <div class="row">
+        <label>Trade<input name="trade" list="trade-list" placeholder="e.g. Plumber" /></label>
+        <label>Contact person<input name="contact" /></label>
+      </div>
+      <div class="row">
+        <label>Phone<input name="phone" type="tel" /></label>
+        <label>Email<input name="email" type="email" /></label>
+      </div>
+      <label>Website<input name="website" placeholder="e.g. acmeplumbing.com" /></label>
+      <label>Rating
+        <select name="rating">
+          <option value="">—</option>
+          <option value="5">★★★★★</option>
+          <option value="4">★★★★</option>
+          <option value="3">★★★</option>
+          <option value="2">★★</option>
+          <option value="1">★</option>
+        </select>
+      </label>
+      <label>Notes<textarea name="notes" rows="3" placeholder="Pricing, availability, past work…"></textarea></label>
+      <div class="dialog-actions">
+        <button type="button" class="danger" data-delete hidden>Delete</button>
+        <span class="spacer"></span>
+        <button type="button" data-cancel>Cancel</button>
+        <button type="submit" class="primary">Save</button>
+      </div>
+    </form>
+  </dialog>
+
+  <datalist id="category-list"></datalist>
+  <datalist id="trade-list">
+    <option>Plumber</option><option>Electrician</option><option>HVAC</option>
+    <option>Roofer</option><option>Landscaper</option><option>Handyman</option>
+    <option>Pest control</option><option>Painter</option><option>Cleaner</option>
+  </datalist>
+
+  <script src="js/logic.js"></script>
+  <script src="js/app.js"></script>
+</body>
+</html>
